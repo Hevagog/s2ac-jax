@@ -12,7 +12,7 @@ class Policy_MLP(GaussianMixin, Model):
         device=None,
         clip_actions=False,
         clip_log_std=True,
-        min_log_std=-20,
+        min_log_std=-5,  # -20 causes log_prob explosion with auto entropy tuning
         max_log_std=2,
         reduction="sum",
         **kwargs,
@@ -24,12 +24,16 @@ class Policy_MLP(GaussianMixin, Model):
 
     @nn.compact  # marks the given module method allowing inlined submodules
     def __call__(self, inputs, role):
-        x = nn.Dense(64)(inputs["states"])
-        x = nn.relu(x)
-        x = nn.Dense(32)(x)
-        x = nn.relu(x)
-        x = nn.Dense(self.num_actions)(x)
-        log_std_parameter = self.param(
-            "log_std_parameter", lambda _: jnp.zeros(self.num_actions)
+        x = nn.Dense(256, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(
+            inputs["states"]
         )
-        return nn.tanh(x), log_std_parameter, {}
+        x = nn.relu(x)
+        x = nn.Dense(256, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(x)
+        x = nn.relu(x)
+        mean = nn.Dense(self.num_actions, kernel_init=nn.initializers.orthogonal(0.01))(
+            x
+        )
+        log_std = nn.Dense(
+            self.num_actions, kernel_init=nn.initializers.orthogonal(0.01)
+        )(x)
+        return mean, log_std, {}

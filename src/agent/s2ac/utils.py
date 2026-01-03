@@ -1,235 +1,247 @@
-import jax.numpy as jnp
-from jax import jit
 import jax
+import jax.numpy as jnp
+from jax import jit, vmap
 
-EPS = 1e-8
+EPS = 1e-9
 
 
 def rbf_kernel(x, y, sigma):
     """
-    Computes the RBF kernel matrix between x and y.
-    References:
+    RBF kernel matrix K_ij = exp(-||x_i - y_j||^2 / (2 * sigma^2)).
+    Returns (K, diffs) where diffs is x[:,None,:] - y[None,:,:] (m,n,d).
+    """
+    diffs = x[:, None, :] - y[None, :, :]  # (m, n, d)
+    sq = jnp.sum(diffs**2, axis=-1)  # (m, n)
+    inv_denom = 1.0 / (2.0 * (sigma**2) + EPS)
+    K = jnp.exp(-sq * inv_denom)
+    return K, diffs
 
-    https://en.wikipedia.org/wiki/Radial_basis_function_kernel
-    https://towardsdatascience.com/radial-basis-function-rbf-kernel-the-go-to-kernel-acf0d22c798a/
 
-    Parameters:
-        sigma: variance parameter for the RBF kernel
+def rbf_pairwise(actions, sigma):
+    """
+    Pairwise kernel among actions (square matrix).
+    Returns (K, diffs, sq_norms).
 
     """
-    # x: (..., d), y: (..., d)
-    diff = (
-        x[..., None, :] - y[..., None, :, :]
-    )  # (batch?, m, m, d) depends on broadcasting
-    sq = jnp.sum(diff**2, axis=-1)
-    K = jnp.exp(-sq / (2.0 * sigma**2))
-    return K, diff  # diff shaped so that grad wrt appropriate particles is easy
+    diffs = actions[:, None, :] - actions[None, :, :]  # (m, m, d)
+    sq_norms = jnp.sum(diffs**2, axis=-1)  # (m, m)
+    inv_denom = 1.0 / (2.0 * (sigma**2) + EPS)
+    K = jnp.exp(-sq_norms * inv_denom)
+    return K, diffs, sq_norms
+
+
+def _get_sqdist_matrix_optimized(x):
+    """
+    Efficient squared-distance matrix: (m,m).
+    Uses a single matmul and broadcasting.
+    """
+    # x: (m, d)
+    # Compute ||x_i - x_j||^2 = ||x_i||^2 + ||x_j||^2 - 2 * x_i @ x_j
+    x_sq = jnp.sum(x * x, axis=1)  # (m,)
+    # Use broadcasting: x_sq[:, None] + x_sq[None, :] is (m, m)
+    sq = x_sq[:, None] + x_sq[None, :] - 2.0 * (x @ x.T)
+    return jnp.maximum(sq, 0.0)
 
 
 @jit
-def rbf_pairwise(actions, sigma):
+def median_heuristic_sigma(actions, h_min=1e-3):
     """
-    Compute pairwise RBF kernel K_{j,i} = k(a_j, a_i) and pairwise diffs (a_i - a_j)
-    actions: (m, d)
-    returns:
-        K: (m, m)   where K[j, i] = exp(-||a_j - a_i||^2 / (2 sigma^2))
-        diffs_i_minus_j: (m, m, d) where [i, j, :] = a_i - a_j
-        sq_norms: (m, m) squared norms ||a_i - a_j||^2 with indexing [i,j]
-    Note: indexing is chosen to make the inner sums in theorem natural (sum over j != i).
+    Median heuristic for RBF bandwidth (returns bandwidth sigma).
     """
-    # actions[..., None, :] - actions[None, ..., :] yields shape (m, m, d) with [i, j, :] = a_i - a_j
-    diffs = actions[:, None, :] - actions[None, :, :]  # (m, m, d) indexed [i, j, :]
-    sq_norms = jnp.sum(diffs**2, axis=-1)  # (m, m) with element [i,j] = ||a_i - a_j||^2
-    K = jnp.exp(-sq_norms / (2.0 * (sigma**2) + EPS))
-    return K, diffs, sq_norms
+    m = actions.shape[0]
+    dist_sq = _get_sqdist_matrix_optimized(actions)
+    # mask out diagonal by adding a large number there
+    mask = 1.0 - jnp.eye(m)
+    maxval = jnp.max(dist_sq)
+    median_sq = jnp.median(dist_sq + (1.0 - mask) * maxval)
+    # paper uses something like h = median_sq / (2 log m) ; we return sigma = sqrt(h)
+    h = jnp.maximum(median_sq / (2.0 * jnp.log(m + 1.0) + EPS), h_min * h_min)
+    sigma = jnp.sqrt(h)
+    return jnp.maximum(sigma, h_min)
 
 
 @jit
 def svgd_vector_field(actions, scores, sigma):
     """
-    Clean SVGD vector field:
-      actions: (m, d)
-      scores:  (m, d)    where scores[j] = ∇_{a_j} log p(a_j)  (here ∇ Q / alpha)
-      sigma:   kernel bandwidth
-    returns:
-      phi: (m, d)
+    SVGD vector field phi evaluated at each particle actions[i].
+    - actions: (m, d)
+    - scores:  (m, d)  (score = grad log target)
+    Returns phi (m,d).
+
+    Formula:
+      phi_i = (1/m) * sum_j [ K_ij * scores_j + grad_{x_j} K_ij ]
+    where grad_{x_j} K_ij = (x_i * sum_j K_ij - (K @ x)_i) / sigma^2
     """
-    m, d = actions.shape
-    # pairwise diffs [i,j,:] = a_i - a_j
-    diffs = actions[:, None, :] - actions[None, :, :]  # (m, m, d)
-    sq = jnp.sum(diffs**2, axis=-1)  # (m, m)
-    K = jnp.exp(-sq / (2.0 * (sigma**2) + EPS))  # (m, m) where K[i,j] = k(a_i, a_j)
+    m = actions.shape[0]
+    inv_m = 1.0 / (m + EPS)
+    sigma_sq = sigma * sigma
+    inv_sigma_sq = 1.0 / (sigma_sq + EPS)
+    inv_2sigma_sq = 0.5 * inv_sigma_sq
 
-    # term1: (1/m) sum_j k(x_j, x_i) * score_j  -> using K^T so K_T[i, j] = k(x_j, x_i)
-    term1 = (K.T @ scores) / m  # (m, d)
+    # Compute squared distances efficiently
+    actions_sq = jnp.sum(actions * actions, axis=1)  # (m,)
+    sq_dists = actions_sq[:, None] + actions_sq[None, :] - 2.0 * (actions @ actions.T)
+    sq_dists = jnp.maximum(sq_dists, 0.0)
 
-    # term2: (1/m) sum_j ∇_{x_j} k(x_j, x_i)
-    # For RBF: ∇_{x_j} k(x_j, x_i) = - (x_j - x_i) / sigma^2 * k(x_j, x_i)
-    # Build (x_j - x_i) arranged as [j,i,:] from actions: actions[:, None, :] - actions[None, :, :] gives [i,j,:] = a_i - a_j
-    a_j_minus_ai = (
-        actions[:, None, :] - actions[None, :, :]
-    ) * -1.0  # now [j, i, :] = a_j - a_i
-    # K[j,i] is k(a_j, a_i) -> use K.T to index as [j,i]
-    K_for_grad = K.T[..., None]  # (m, m, 1) with [j,i,0] = k(a_j,a_i)
-    G = -a_j_minus_ai * K_for_grad / (sigma**2 + EPS)  # (m, m, d) with [j,i,:] shape
-    # sum over j to get per i vector
-    term2 = jnp.sum(G, axis=1) / m  # (m, d) sum over neighbors j for each target i
+    # Kernel matrix
+    K = jnp.exp(-sq_dists * inv_2sigma_sq)  # (m, m)
 
-    phi = term1 + term2
-    return phi
+    # term1 = (1/m) * K @ scores
+    term1 = (K @ scores) * inv_m
+
+    # repulsive term: (1/m) * sum_j grad_{x_i} K_ij
+    # grad_{x_i} K_ij = (x_i - x_j) * K_ij / sigma^2
+    # sum_j = (x_i * sum_j K_ij - (K @ x)_i) / sigma^2
+    K_sum = jnp.sum(K, axis=1, keepdims=True)  # (m, 1)
+    K_actions = K @ actions  # (m, d)
+    grad_k_sum = actions * K_sum - K_actions  # (m, d)
+    term2 = grad_k_sum * (inv_sigma_sq * inv_m)
+
+    return term1 + term2
+
+
+def _q_scalar_closure(critic_apply_fn, critic_params, critic_reduce):
+    """
+    Returns a scalar-q callable q_scalar(a, s) -> scalar, used by jax.grad.
+    Assumes critic_apply_fn(params, s, a) -> scalar-or-vector.
+
+    """
+
+    def q_scalar(a, s):
+        q_out = critic_apply_fn(critic_params, s, a)
+        q_out = jnp.asarray(q_out)
+        if q_out.ndim == 0:
+            return q_out
+        return critic_reduce(q_out)
+
+    return q_scalar
+
+
+def action_grad_from_Q(
+    critic_apply_fn, critic_params, state, actions, critic_reduce=jnp.min
+):
+    """
+    Compute ∇_a Q(s,a). Supports:
+      - `state` 1D (single state): will map across actions -> returns (m,d)
+      - `state` 2D (batch, s_dim): must be same batch length as actions (m,...).
+
+    """
+    q_scalar = _q_scalar_closure(critic_apply_fn, critic_params, critic_reduce)
+    grad_fn = jax.grad(q_scalar, argnums=0)
+
+    state_axis = 0 if state.ndim > 1 else None
+    return jax.vmap(grad_fn, in_axes=(0, state_axis))(actions, state)
 
 
 def action_score_from_Q(
     critic_apply_fn, critic_params, state, actions, alpha, critic_reduce=jnp.min
 ):
     """
-    Compute action-space score (1/alpha * grad_a Q(s,a)) for each action in `actions`.
+    Score used by S2AC: score = (1/alpha) * ∇_a Q(s,a)
 
-    Parameters
-    ----------
-    critic_apply_fn : callable
-        Function (params, state, action) -> scalar-or-vector Q(s,a).
-        Often a wrapper around model.apply or model.act. If it returns a vector
-        (e.g. multiple critic heads), we reduce it to a scalar using `critic_reduce`.
-    critic_params : pytree
-        Parameters of the critic passed to critic_apply_fn.
-    state : array (state_dim,) or (m, state_dim)
-        Single environment state (will be tiled) or tiled states matching `actions`.
-    actions : array (m, d)
-        Particles / actions for which to compute the score.
-    alpha : float
-        Temperature used in S2AC; we return grad(Q)/alpha.
-    critic_reduce : callable, optional
-        Reducer applied to multi-headed critic outputs to produce a scalar.
-        Default: jnp.min  (safest, like twin critics).
-
-    Returns
-    -------
-    grad_q : array (m, d)
-        The action gradients (1/alpha * grad_a Q(s, a)) for each particle/action.
     """
-    m = actions.shape[0]
-
-    # Ensure state has batch dimension matching actions.
-    if state.ndim == 1:
-        state_tiled = jnp.repeat(state[None, :], m, axis=0)
-    else:
-        state_tiled = state
-
-    # Define scalar-valued Q for a single action and state
-    def q_scalar(a, s):
-        # critic_apply_fn is expected to accept (params, state, action) and return either scalar or vector.
-        q_out = critic_apply_fn(critic_params, s, a)
-        q_out = jnp.asarray(q_out)
-        # If scalar already, return it; if vector, reduce (e.g., min across heads).
-        # Note: using `critic_reduce` (e.g., jnp.min) yields a scalar
-        if q_out.ndim == 0:
-            return q_out
-        else:
-            return critic_reduce(q_out)
-
-    # gradient w.r.t. first arg (the action). jax.grad default argnums=0 but explicit is clearer.
-    grad_fn = jax.grad(q_scalar, argnums=0)
-
-    # vmap across actions and states
-    grad_q = jax.vmap(grad_fn)(actions, state_tiled)  # shape (m, d)
-
-    # return grad divided by alpha (since objective uses Q/alpha)
-    return grad_q / (alpha + 1e-12)
-
-
-@jit
-def logq0_isotropic_gaussian(a0, mu, logstd):
-    """
-    Compute log q0(a0) for isotropic (per-dim) Gaussian param:
-      a0: (m, d)
-      mu: (d,)  or (1, d)
-      logstd: (d,) or (1, d)
-    returns:
-      logq0: (m,) per particle
-    """
-    d = a0.shape[-1]
-    mu = jnp.reshape(mu, (1, d))
-    logstd = jnp.reshape(logstd, (1, d))
-    var = jnp.exp(2.0 * logstd)
-    # log pdf per-dim: -0.5 * ( (a-mu)^2 / var ) - 0.5*log(2π) - logstd
-    # sum over dims
-    lp = jnp.sum(
-        -0.5 * ((a0 - mu) ** 2) / (var + EPS) - 0.5 * jnp.log(2.0 * jnp.pi) - logstd,
-        axis=-1,
+    grad_q = action_grad_from_Q(
+        critic_apply_fn, critic_params, state, actions, critic_reduce=critic_reduce
     )
-    return lp  # shape (m,)
+    return grad_q / (alpha + EPS)
+
+
+def _logqL_step(a_curr, gradQ_curr, sigma_kernel, eps, alpha_internal=1.0):
+    m, d = a_curr.shape
+    sigma_sq = sigma_kernel * sigma_kernel
+    inv_sigma_sq = 1.0 / (sigma_sq + 1e-6)
+
+    # Pairwise squared dists
+    a_sq = jnp.sum(a_curr * a_curr, axis=1)
+    dist_sq = jnp.maximum(
+        a_sq[:, None] + a_sq[None, :] - 2.0 * (a_curr @ a_curr.T), 0.0
+    )
+
+    K = jnp.exp(-dist_sq * (0.5 * inv_sigma_sq))
+
+    # dot_terms_ij = (a_i - a_j)^T * gradQ_j
+    term_a = a_curr @ gradQ_curr.T
+    term_b_vec = jnp.sum(a_curr * gradQ_curr, axis=1)
+    dot_terms = term_a - term_b_vec[None, :]
+
+    mask = 1.0 - jnp.eye(m)
+
+    M = K * (
+        dot_terms + (alpha_internal * inv_sigma_sq) * dist_sq - (d * alpha_internal)
+    )
+    M = M * mask
+
+    per_i_sum = -1.0 * jnp.sum(M, axis=1)
+    coeff = eps / ((m + 1e-6) * (sigma_sq + 1e-6))
+    return coeff * per_i_sum
 
 
 @jit
 def compute_logqL_closed_form(
-    a0, all_a_list, all_gradQ_list, mu0, logstd0, eps, sigma_kernel, alpha
+    a0, all_a_list, all_gradQ_list, mu0, logstd0, eps, sigma_list, alpha
 ):
     """
-    Compute approximation of log q_L for each final particle using Theorem 3.3 (Appendix H).
+    Compute approximated log q_L for final particles.
 
-    Args:
-      a0: (m, d) initial particles used to compute logq0
-      all_a_list: list length L of arrays (m, d) corresponding to a_l for l=0..L-1 (particles at each step)
-                  NOTE: paper's formula sums l=0..L-1 where a_l denotes particles before step l->l+1.
-      all_gradQ_list: list length L of arrays (m, d) where all_gradQ_list[l][j] = ∇_{a_{l,j}} Q(s, a_{l,j})
-      mu0, logstd0: initial Gaussian parameters for q0 (mu shape (d,), logstd shape (d,))
-      eps: scalar step size ϵ
-      sigma_kernel: kernel bandwidth σ
-      alpha: temperature α
+    - a0: (m,d) initial u particles (u0)
+    - all_a_list: list or stack of length T, each (m,d) (u at each step)
+    - all_gradQ_list: list or stack (T, m, d)
+    - mu0, logstd0: (d,) or (1,d) initial gaussian params (for u0)
+    - eps: scalar step size
+    - sigma_list: (T,) array of kernel sigmas used at each step, or scalar
+    - alpha: scalar temperature
+    Returns logqL: (m,) per-particle log-likelihood estimate.
 
-    Returns:
-      logqL_particles: (m,) vector of approximated log q_L evaluated at each final particle a_L[i]
-                       Note: the approximation shares the same size m for outputs; it corresponds to each final particle's log-likelihood.
     """
-    m, d = a0.shape
-    logq0 = logq0_isotropic_gaussian(a0, mu0, logstd0)  # (m,)
+    # log q0 (initial isotropic gaussian in u-space)
+    d = a0.shape[-1]
+    mu0 = jnp.reshape(mu0, (1, d))
+    logstd0 = jnp.reshape(logstd0, (1, d))
+    var = jnp.exp(2.0 * logstd0)
+    inv_var = 1.0 / (var + EPS)
 
-    # accumulate the inner sums over steps and neighbors
-    accum = jnp.zeros((m,))  # will accumulate per-particle scalar sum over l and j
-    coeff = eps / (m * (sigma_kernel**2) + EPS)
+    # Precompute constants
+    log_2pi = jnp.log(2.0 * jnp.pi)
 
-    # loop over SVGD steps (L small in practice, so Python loop is fine; we jit the whole function)
-    for a_l, gradQ_l in zip(all_a_list, all_gradQ_list):
-        # a_l: (m, d), gradQ_l: (m, d) with index j corresponding to particle j
-        K, diffs, sq_norms = rbf_pairwise(
-            a_l, sigma_kernel
-        )  # K shape (m,m) with [i,j] = k(a_i, a_j)
-        # NOTE indexing: our K[i,j] = k(a_i, a_j) (i is "target" particle index, j is neighbor index)
-        # The formula in the paper uses k(a_{l,j}, a_{l,i}) and sum over j != i. That is K_T in prior code.
-        # We can align to paper by transposing: K_paper = K.T so that K_paper[j,i] = K[i,j].
-        K_paper = K.T  # now K_paper[j, i] = k(a_{l,j}, a_{l,i})
+    logq0 = jnp.sum(
+        -0.5 * ((a0 - mu0) ** 2) * inv_var - 0.5 * log_2pi - logstd0,
+        axis=-1,
+    )
 
-        # diffs has diffs[i,j,:] = a_i - a_j, but the paper uses (a_i - a_j)·grad_{a_j}Q(s,a_j), sum over j != i
-        # For each pair (i, j) we need:
-        #   term_dot = (a_i - a_j)^T gradQ_l[j]
-        # We can compute matrix of shape (m, m) where E[i,j] = (a_i - a_j)·gradQ_l[j]
-        # Build gradQ expanded: shape (m, m, d) where [i,j,:] use gradQ_l[j]
-        gradQ_expanded = jnp.broadcast_to(
-            gradQ_l[None, :, :], (m, m, d)
-        )  # [i,j,:] copies gradQ_l[j]
-        # diffs is [i, j, :] = a_i - a_j  (already what we need)
-        dot_terms = jnp.sum(
-            diffs * gradQ_expanded, axis=-1
-        )  # (m, m) where [i,j] = (a_i - a_j)^T gradQ_l[j]
+    # stack lists -> (T, m, d)
+    traj_a = jnp.stack(all_a_list)  # (T, m, d)
+    traj_gradQ = jnp.stack(all_gradQ_list)  # (T, m, d)
+    T = traj_a.shape[0]
 
-        # norm squared term ||a_i - a_j||^2 is sq_norms [i, j]
-        # Note we must exclude diagonal j == i; in formula sum_{j != i}
-        mask = 1.0 - jnp.eye(m)  # (m,m) zeros on diag, ones elsewhere
+    # ensure sigma_list shape matches T - handle scalar vs array case
+    sigma_arr = jnp.atleast_1d(sigma_list)
+    # If scalar was passed (now shape (1,)), broadcast to (T,)
+    sigma_arr = jnp.where(
+        sigma_arr.shape[0] == 1, jnp.broadcast_to(sigma_arr, (T,)), sigma_arr
+    )
 
-        # Compute per-pair contribution matrix M[i,j] = K_paper[j, i] * ( dot_terms[i,j] + (alpha/sigma^2) * sq_norms[i,j] - d*alpha )
-        # Careful with indexing: K_paper[j,i] = K.T[j,i] = K[i,j] in our original K; equivalently K_paper = K.T
-        M = K_paper * (
-            dot_terms + (alpha / (sigma_kernel**2 + EPS)) * sq_norms - (d * alpha)
-        )
+    # per-step logqL increments using vmap
+    def step_fn(a_step, gq_step, sigma_step):
+        return _logqL_step(a_step, gq_step, sigma_step, eps, alpha_internal=alpha)
 
-        # Zero out diagonal contributions
-        M = M * mask
+    per_step = vmap(step_fn, in_axes=(0, 0, 0))(traj_a, traj_gradQ, sigma_arr)  # (T, m)
+    accum = jnp.sum(per_step, axis=0)  # (m,)
 
-        # Sum over j for each i: per_i_sum = sum_j M[i, j]
-        per_i_sum = jnp.sum(M, axis=1)  # (m,) sum over j
+    logqL = logq0 + accum
+    return logqL
 
-        accum = accum + per_i_sum
 
-    logqL = logq0 + coeff * accum
-    return logqL  # shape (m,)
+@jit
+def svgd_vector_field_s2ac(actions, grad_q, sigma, alpha):
+    """
+    SVGD vector field for S2AC.
+    Wrapper around the optimized svgd_vector_field.
+
+    """
+    # The score function is grad_a Q(a) / alpha
+    # IMPORTANT: grad_q should be detached before calling this if you don't want
+    # gradients to flow through the score function (standard SVGD).
+    inv_alpha = 1.0 / alpha
+    scores = grad_q * inv_alpha
+    # Reuse the optimized calculation
+    return svgd_vector_field(actions, scores, sigma)

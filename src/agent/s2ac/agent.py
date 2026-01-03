@@ -1,89 +1,39 @@
 from typing import Union, Tuple, Dict, Any, Optional
 
 import copy
-import numpy as np
 import gymnasium
 import jax
 import jax.numpy as jnp
-from jax import random
-import jax.nn as jnn
+import numpy as np
+from jax import random, lax
+import optax
 
 from skrl import config
 from skrl.memories.jax import Memory
 from skrl.models.jax import Model
-from skrl.resources.optimizers.jax import Adam
 
 from skrl.agents.jax import Agent
-from .utils import action_score_from_Q, compute_logqL_closed_form, svgd_vector_field
-
-# fmt: off
-# [start-config-dict-jax]
-S2AC_DEFAULT_CONFIG = {
-    "particles": 16,
-    "svgd_steps": 3,
-    "svgd_step_size": 0.1,
-    "kernel_sigma": 0.5,
-    "alpha": 0.2,
-    "action_scale": 1.0,
-    "batch_size": 256,
-    "discount": 0.99,
-    "tau": 0.005,
-    "actor_lr": 3e-4,
-    "critic_lr": 3e-4,
-    "critic_target_update_interval": 1,
-
-    
-    "experiment": {
-        "directory": "",  # experiment's parent directory
-        "experiment_name": "",  # experiment name
-        "write_interval": 250,  # TensorBoard writing interval (timesteps)
-        "checkpoint_interval": 1000,  # interval for checkpoints (timesteps)
-        "store_separately": False,  # whether to store checkpoints separately
-        "wandb": False,  # whether to use Weights & Biases
-        "wandb_kwargs": {},  # wandb kwargs (see https://docs.wandb.ai/ref/python/init)
-    }
-}
-
-
-def _pytree_l2_norm(pytree):
-    """Compute the L2 norm of a gradient pytree."""
-    leaves = [leaf for leaf in jax.tree_util.tree_leaves(pytree) if leaf is not None]
-    if not leaves:
-        return jnp.array(0.0, dtype=jnp.float32)
-    sq_sum = jnp.sum(jnp.stack([jnp.sum(jnp.square(leaf)) for leaf in leaves]))
-    return jnp.sqrt(sq_sum)
+from .utils import (
+    compute_logqL_closed_form,
+    svgd_vector_field_s2ac,
+    median_heuristic_sigma,
+)
+from .s2ac_cfg import S2AC_DEFAULT_CONFIG
+from .optimizers import AdamW
 
 
 class S2AC(Agent):
+    """Stein Soft Actor-Critic (S2AC) agent using SVGD for policy optimization."""
+
     def __init__(
         self,
         models: Dict[str, Model],
         memory: Optional[Union[Memory, Tuple[Memory]]] = None,
         observation_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
         action_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
-        device: Optional[Union[str, Any]] = None,
-        cfg: Optional[dict] = None,
+        device: Optional[Union[str, jax.Device]] = None,
+        cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Stein Soft Actor-Critic (S2AC)
-
-        https://arxiv.org/abs/2405.00987
-
-        :param models: Models used by the agent
-        :type models: dictionary of skrl.models.jax.Model
-        :param memory: Memory to storage the transitions.
-                       If it is a tuple, the first element will be used for training and
-                       for the rest only the environment transitions will be added
-        :type memory: skrl.memory.jax.Memory, list of skrl.memory.jax.Memory or None
-        :param observation_space: Observation/state space or shape (default: None)
-        :type observation_space: int, tuple or list of integers, gymnasium.Space or None, optional
-        :param action_space: Action space or shape (default: None)
-        :type action_space: int, tuple or list of integers, gymnasium.Space or None, optional
-        :param device: Device on which a jax array is or will be allocated (default: ``None``).
-                       If None, the device will be either ``"cuda:0"`` if available or ``"cpu"``
-        :type device: str or Any, optional
-        :param cfg: Configuration dictionary
-        :type cfg: dict
-        """
         _cfg = copy.deepcopy(S2AC_DEFAULT_CONFIG)
         _cfg.update(cfg if cfg is not None else {})
         super().__init__(
@@ -95,113 +45,545 @@ class S2AC(Agent):
             cfg=_cfg,
         )
 
-        self.policy = self.models.get("policy", None)
-        self.critic_model = self.models.get("critic", None)
-        self.target_critic = self.models.get("target_critic", None)
+        self._num_particles = self.cfg.get("particles")
+        self._svgd_steps = self.cfg.get("svgd_steps")
+        self._svgd_step_size = self.cfg.get("svgd_step_size")
+        self._kernel_sigma = self.cfg.get("kernel_sigma")
+        self._kernel_sigma_adaptive = self.cfg.get("kernel_sigma_adaptive")
+        self._stop_grad_svgd_score = self.cfg.get("stop_grad_svgd_score")
+        self._use_soft_q_backup = self.cfg.get("use_soft_q_backup")
 
-        if self.policy is None or self.critic_model is None or self.target_critic is None:
-            raise ValueError("S2AC agent requires 'policy', 'critic' and 'target_critic' models")
+        self._batch_size = self.cfg.get("batch_size")
+        self._discount = self.cfg.get("discount")
+        self._tau = self.cfg.get("tau")
+        self._actor_lr = self.cfg.get("actor_lr")
+        self._critic_lr = self.cfg.get("critic_lr")
+        self._critic_target_update_interval = self.cfg.get(
+            "critic_target_update_interval"
+        )
+        self._actor_update_frequency = self.cfg.get("actor_update_frequency")
+        self._update_counter = 0
 
-        self.checkpoint_modules["policy"] = self.policy
-        self.checkpoint_modules["critic"] = self.critic_model
-        self.checkpoint_modules["target_critic"] = self.target_critic
+        self._entropy_floor = self.cfg.get("entropy_floor")
+        self._entropy_floor_coef = self.cfg.get("entropy_floor_coef")
 
-        self._policy_role = "policy"
-        self._critic_role = "critic"
-        self._target_role = "target_critic"
+        self._auto_entropy_tuning = self.cfg.get("auto_entropy_tuning")
+        self._alpha = self.cfg.get("alpha")
+        self._target_entropy = self.cfg.get("target_entropy")
 
-        self._particles = int(self.cfg["particles"])
-        self._svgd_steps = int(self.cfg["svgd_steps"])
-        self._svgd_step_size = float(self.cfg["svgd_step_size"])
-        self._kernel_sigma = float(self.cfg["kernel_sigma"])
-        self._alpha = float(self.cfg["alpha"])
-        self._action_scale = float(self.cfg["action_scale"])
-        self._batch_size = int(self.cfg["batch_size"])
-        self._discount = float(self.cfg["discount"])
-        self._tau = float(self.cfg["tau"])
-        self._actor_lr = float(self.cfg["actor_lr"])
-        self._critic_lr = float(self.cfg["critic_lr"])
-        self._critic_target_update_interval = int(self.cfg["critic_target_update_interval"])
+        self._reward_scale = self.cfg.get("reward_scale")
+        self._random_timesteps = self.cfg.get("random_timesteps")
+        self._learning_starts = self.cfg.get("learning_starts")
+        self._grad_norm_clip = self.cfg.get("grad_norm_clip")
 
-        # determine action dim
-        if isinstance(self.action_space, gymnasium.spaces.Box):
-            self._action_dim = int(jnp.prod(jnp.asarray(self.action_space.shape)))
-        elif isinstance(self.action_space, (tuple, list)):
-            self._action_dim = int(jnp.prod(jnp.asarray(self.action_space)))
+        twin_cfg = bool(self.cfg.get("twin_critics"))
+        has_critic2 = self.models.get("critic_2", None) is not None
+        has_target2 = self.models.get("target_critic_2", None) is not None
+        if twin_cfg:
+            if has_critic2 or has_target2:
+                if not (has_critic2 and has_target2):
+                    raise ValueError(
+                        "Twin critics requested/provided but critic_2/target_critic_2 are inconsistent"
+                    )
+                self._twin_critics = True
+            else:
+                self._twin_critics = False
         else:
-            self._action_dim = int(self.action_space)
+            self._twin_critics = False
 
-        self._rng_key = random.PRNGKey(self.cfg.get("seed", 0))
-
-        with jax.default_device(self.device):
-            self.policy_optimizer = Adam(model=self.policy, lr=self._actor_lr)
-            self.critic_optimizer = Adam(model=self.critic_model, lr=self._critic_lr)
-        self.checkpoint_modules["policy_optimizer"] = self.policy_optimizer
-        self.checkpoint_modules["critic_optimizer"] = self.critic_optimizer
-
-        if self.target_critic is not None:
-            self.target_critic.freeze_parameters(True)
-            self.target_critic.update_parameters(self.critic_model, polyak=1.0)
-
-        self._update_steps = 0
-
-
-
-
-    def init(self, trainer_cfg: Optional[Dict[str, Any]] = None) -> None:
-        """Initialize the agent"""
-        super().init(trainer_cfg=trainer_cfg)
-        self.set_mode("eval")
-
-        # create tensors in memory
-        if self.memory is not None:
-            self.memory.create_tensor("states", size=self.observation_space, dtype=jnp.float32)
-            self.memory.create_tensor("actions", size=self.action_space, dtype=jnp.float32)
-            self.memory.create_tensor("rewards", size=1, dtype=jnp.float32)
-            self.memory.create_tensor("next_states", size=self.observation_space, dtype=jnp.float32)
-            self.memory.create_tensor("terminated", size=1, dtype=jnp.int8)
-            self.memory.create_tensor("truncated", size=1, dtype=jnp.int8)
-            self._tensors_names = [
-                "states",
-                "actions",
-                "rewards",
-                "next_states",
-                "terminated",
-                "truncated",
+        self.policy = self.models.get("policy", None)
+        self.critic_models = []
+        if self._twin_critics:
+            self.critic_models = [
+                self.models.get("critic_1", self.models.get("critic", None)),
+                self.models.get("critic_2", None),
+            ]
+            self.target_critic_models = [
+                self.models.get(
+                    "target_critic_1", self.models.get("target_critic", None)
+                ),
+                self.models.get("target_critic_2", None),
+            ]
+        else:
+            self.critic_models = [
+                self.models.get("critic", self.models.get("critic_1", None))
+            ]
+            self.target_critic_models = [
+                self.models.get(
+                    "target_critic", self.models.get("target_critic_1", None)
+                )
             ]
 
-        # set up models for just-in-time compilation with XLA
-        self.policy.apply = jax.jit(self.policy.apply, static_argnums=2)
-        self.critic_model.apply = jax.jit(self.critic_model.apply, static_argnums=2)
-        if self.target_critic is not None:
-            self.target_critic.apply = jax.jit(self.target_critic.apply, static_argnums=2)
+        if self.policy is None:
+            raise ValueError("Policy model is required")
+        for i, c in enumerate(self.critic_models):
+            if c is None:
+                raise ValueError(f"Critic model {i} is required")
+        for i, tc in enumerate(self.target_critic_models):
+            if tc is None:
+                raise ValueError(f"Target critic model {i} is required")
 
-    def act(
-        self, states: Union[jnp.ndarray, Any], timestep: int, timesteps: int
-    ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray], Dict[str, Any]]:
-        states = jnp.asarray(states)
-        if states.ndim == 1:
-            states = states.reshape(1, -1)
+        self.critic_model = self.critic_models[0]
+        self.target_critics = self.target_critic_models
+        self._particles = self._num_particles
+
+        if hasattr(self.action_space, "shape") and self.action_space.shape is not None:
+            self._action_dim = self.action_space.shape[0]
+        elif isinstance(self.action_space, (tuple, list)):
+            self._action_dim = self.action_space[0]
+        else:
+            self._action_dim = self.action_space
+
+        if hasattr(self.action_space, "low") and hasattr(self.action_space, "high"):
+            self._action_scale = jnp.array(
+                (self.action_space.high - self.action_space.low) / 2.0,
+                dtype=jnp.float32,
+            )
+            self._action_bias = jnp.array(
+                (self.action_space.high + self.action_space.low) / 2.0,
+                dtype=jnp.float32,
+            )
+        else:
+            self._action_scale = jnp.ones(self._action_dim, dtype=jnp.float32)
+            self._action_bias = jnp.zeros(self._action_dim, dtype=jnp.float32)
+
+        if self._target_entropy is None:
+            self._target_entropy = -float(self._action_dim)
+
+        self._log_alpha = jnp.log(jnp.array(self._alpha, dtype=jnp.float32))
+        self._rng_key = random.PRNGKey(0)
+
+        self._tensors_names = [
+            "states",
+            "actions",
+            "rewards",
+            "next_states",
+            "terminated",
+            "truncated",
+        ]
+
+        self._weight_decay = self.cfg.get("weight_decay", 1e-4)
+
+        self.checkpoint_modules["policy"] = self.policy
+        for i, c in enumerate(self.critic_models):
+            self.checkpoint_modules[f"critic_{i}"] = c
+        for i, tc in enumerate(self.target_critic_models):
+            self.checkpoint_modules[f"target_critic_{i}"] = tc
+
+    def _space_shape(self, space_like) -> Tuple[int, ...]:
+        if space_like is None:
+            raise ValueError("Space is required to infer tensor shapes")
+        if hasattr(space_like, "shape") and space_like.shape is not None:
+            return tuple(space_like.shape)
+        if isinstance(space_like, int):
+            return (space_like,)
+        if isinstance(space_like, (tuple, list)):
+            return tuple(space_like)
+        raise TypeError(
+            f"Unsupported space type for shape inference: {type(space_like)}"
+        )
+
+    def _memory_has_tensor(self, name: str) -> bool:
+        if self.memory is None:
+            return False
+        try:
+            _ = self.memory.tensors_keep_dimensions[name]
+            return True
+        except Exception:
+            pass
+        try:
+            _ = self.memory.tensors[name]
+            return True
+        except Exception:
+            return False
+
+    def _ensure_memory_tensors(self) -> None:
+        if self.memory is None:
+            return
+        if not hasattr(self.memory, "create_tensor"):
+            return
+
+        obs_shape = self._space_shape(self.observation_space)
+        act_shape = self._space_shape(self.action_space)
+
+        specs = [
+            ("states", obs_shape, jnp.float32, False),
+            ("actions", act_shape, jnp.float32, False),
+            ("rewards", (1,), jnp.float32, False),
+            ("next_states", obs_shape, jnp.float32, False),
+            ("terminated", (1,), bool, False),
+            ("truncated", (1,), bool, False),
+        ]
+
+        for name, size, dtype, keep_dimensions in specs:
+            if not self._memory_has_tensor(name):
+                self.memory.create_tensor(
+                    name=name, size=size, dtype=dtype, keep_dimensions=keep_dimensions
+                )
+
+    def init(self, trainer_cfg: Optional[Dict[str, Any]] = None) -> None:
+        super().init(trainer_cfg)
+        self.set_mode("train")
+        self._ensure_memory_tensors()
+
+        for critic, target in zip(self.critic_models, self.target_critic_models):
+            target.update_parameters(critic, polyak=1.0)
+
+        # If scale set to true, the learning rate would be applied twice, once by the optimizer and once by the step call.
+
+        self.policy_optimizer = AdamW(
+            model=self.policy,
+            lr=self._actor_lr,
+            weight_decay=self._weight_decay,
+            grad_norm_clip=self._grad_norm_clip,
+            scale=False,
+        )
+        if self._twin_critics:
+            self.critic_optimizer_1 = AdamW(
+                model=self.critic_models[0],
+                lr=self._critic_lr,
+                weight_decay=self._weight_decay,
+                grad_norm_clip=self._grad_norm_clip,
+                scale=False,
+            )
+            self.critic_optimizer_2 = AdamW(
+                model=self.critic_models[1],
+                lr=self._critic_lr,
+                weight_decay=self._weight_decay,
+                grad_norm_clip=self._grad_norm_clip,
+                scale=False,
+            )
+        else:
+            self.critic_optimizer = AdamW(
+                model=self.critic_models[0],
+                lr=self._critic_lr,
+                weight_decay=self._weight_decay,
+                grad_norm_clip=self._grad_norm_clip,
+                scale=False,
+            )
+
+        if self._auto_entropy_tuning:
+            self.alpha_optimizer = optax.adamw(
+                learning_rate=self._actor_lr, weight_decay=0.0
+            )
+            self.alpha_opt_state = self.alpha_optimizer.init(self._log_alpha)
+
+        self._setup_loss_functions()
+
+        def _alpha_loss_fn(log_alpha, log_prob_mean):
+            alpha = jnp.exp(log_alpha)
+            return -alpha * (log_prob_mean + self._target_entropy)
+
+        self._alpha_value_and_grad = jax.jit(jax.value_and_grad(_alpha_loss_fn))
+
+    def _setup_loss_functions(self):
+        # Critic loss function
+        if self._twin_critics:
+
+            def _critic_loss_fn_twin(params1, params2, states, actions, targets):
+                pred1 = self._critic_values_single(
+                    self.critic_models[0], params1, states, actions
+                )
+                pred2 = self._critic_values_single(
+                    self.critic_models[1], params2, states, actions
+                )
+                loss = jnp.mean((pred1 - targets) ** 2 + (pred2 - targets) ** 2)
+                metrics = {
+                    "prediction_mean": 0.5 * (jnp.mean(pred1) + jnp.mean(pred2)),
+                    "prediction_std": 0.5 * (jnp.std(pred1) + jnp.std(pred2)),
+                }
+                return loss, metrics
+
+            self._critic_value_and_grad = jax.jit(
+                jax.value_and_grad(_critic_loss_fn_twin, argnums=(0, 1), has_aux=True)
+            )
+        else:
+
+            def _critic_loss_fn_single(params, states, actions, targets):
+                pred = self._critic_values_single(
+                    self.critic_models[0], params, states, actions
+                )
+                loss = jnp.mean((pred - targets) ** 2)
+                metrics = {
+                    "prediction_mean": jnp.mean(pred),
+                    "prediction_std": jnp.std(pred),
+                }
+                return loss, metrics
+
+            self._critic_value_and_grad = jax.jit(
+                jax.value_and_grad(_critic_loss_fn_single, has_aux=True)
+            )
+
+        # Actor loss function
+        if self._twin_critics:
+
+            def _actor_loss_fn_twin(
+                policy_params, critic1_params, critic2_params, states, keys, log_alpha
+            ):
+                alpha = jnp.exp(log_alpha)
+
+                # SVGD Rollout -> get both u (unbounded) and scaled actions
+                particles_u, particles_a, _ = self._svgd_rollout_batch(
+                    policy_params,
+                    (self.critic_models[0], self.critic_models[1]),
+                    (critic1_params, critic2_params),
+                    states,
+                    keys,
+                )
+                particles_a = jax.lax.stop_gradient(particles_a)
+
+                # Compute GRAD Q in u-space (attraction)
+                # get scalar Q(u, s) callable for grads
+                q_min_wrt_u = self._make_q_wrt_u_scalar(
+                    (self.critic_models[0], self.critic_models[1]),
+                    (critic1_params, critic2_params),
+                )
+
+                # vmap over batch and particles to compute grad dQ/du
+                grad_q = jax.vmap(
+                    jax.vmap(jax.grad(q_min_wrt_u), in_axes=(0, None)),
+                    in_axes=(0, 0),
+                )(particles_u, states)
+
+                # Stein Force (operate in u-space)
+                def compute_batch_force_u(p_batch_u, g_batch_u):
+                    sigma = (
+                        self._mean_heuristic_sigma(p_batch_u)
+                        if self._kernel_sigma_adaptive
+                        else self._kernel_sigma
+                    )
+                    sigma = jnp.maximum(sigma, 0.1)
+                    if self._stop_grad_svgd_score:
+                        g_batch_u = jax.lax.stop_gradient(g_batch_u)
+                    return svgd_vector_field_s2ac(p_batch_u, g_batch_u, sigma, alpha)
+
+                stein_forces = jax.vmap(compute_batch_force_u)(particles_u, grad_q)
+                stein_forces_sg = jax.lax.stop_gradient(stein_forces)
+
+                # Surrogate Loss: re-evaluate rollout (differentiable) to produce u outputs
+                # Here we use u (the first returned element) so autodiff flows through u -> policy_params
+                particles_u_for_grad, _, _ = self._svgd_rollout_batch(
+                    policy_params,
+                    (self.critic_models[0], self.critic_models[1]),
+                    (critic1_params, critic2_params),
+                    states,
+                    keys,
+                )
+                surrogate_loss = -jnp.mean(
+                    jnp.sum(particles_u_for_grad * stein_forces_sg, axis=-1)
+                )
+
+                # Metrics
+                q1 = self._critic_values_particles(
+                    self.critic_models[0], critic1_params, states, particles_a
+                )
+                q2 = self._critic_values_particles(
+                    self.critic_models[1], critic2_params, states, particles_a
+                )
+                q_values = jnp.minimum(q1, q2)
+
+                particle_std = jnp.mean(jnp.std(particles_a, axis=1), axis=-1)
+                entropy_est = 0.5 * self._action_dim * (
+                    1.0 + jnp.log(2 * jnp.pi)
+                ) + jnp.log(particle_std + 1e-8)
+
+                # Additional metrics
+                stein_force_norm = jnp.mean(jnp.linalg.norm(stein_forces_sg, axis=-1))
+                grad_q_norm = jnp.mean(jnp.linalg.norm(grad_q, axis=-1))
+
+                if self._kernel_sigma_adaptive:
+                    sigmas = jax.vmap(self._mean_heuristic_sigma)(particles_u)
+                    mean_sigma = jnp.mean(sigmas)
+                else:
+                    mean_sigma = self._kernel_sigma if self._kernel_sigma else 0.0
+
+                metrics = {
+                    "q_mean": jnp.mean(q_values),
+                    "q_std": jnp.std(q_values),
+                    "entropy_mean": jnp.mean(entropy_est),
+                    "entropy_std": jnp.std(entropy_est),
+                    "log_prob_mean": -jnp.mean(entropy_est),
+                    "log_prob_std": jnp.std(entropy_est),
+                    "alpha": alpha,
+                    "particle_std": jnp.mean(particle_std),
+                    "stein_force_norm": stein_force_norm,
+                    "grad_q_norm": grad_q_norm,
+                    "kernel_sigma_mean": mean_sigma,
+                    "entropy_floor_penalty": 0.0,
+                }
+                return surrogate_loss, metrics
+
+            self._actor_value_and_grad = jax.jit(
+                jax.value_and_grad(_actor_loss_fn_twin, argnums=0, has_aux=True)
+            )
+        else:
+            # Single critic version
+            def _actor_loss_fn_single(
+                policy_params, critic_params, states, keys, log_alpha
+            ):
+                alpha = jnp.exp(log_alpha)
+
+                particles_u, particles_a, _ = self._svgd_rollout_batch(
+                    policy_params, self.critic_models[0], critic_params, states, keys
+                )
+                particles_a = jax.lax.stop_gradient(particles_a)
+
+                q_wrt_u_scalar = self._make_q_wrt_u_scalar(
+                    self.critic_models[0], critic_params
+                )
+
+                grad_q = jax.vmap(
+                    jax.vmap(jax.grad(q_wrt_u_scalar), in_axes=(0, None)),
+                    in_axes=(0, 0),
+                )(particles_u, states)
+
+                # Stein Force
+                def compute_batch_force_u(p_batch_u, g_batch_u):
+                    sigma = (
+                        self._mean_heuristic_sigma(p_batch_u)
+                        if self._kernel_sigma_adaptive
+                        else self._kernel_sigma
+                    )
+                    sigma = jnp.maximum(sigma, 0.1)
+
+                    if self._stop_grad_svgd_score:
+                        g_batch_u = jax.lax.stop_gradient(g_batch_u)
+
+                    return svgd_vector_field_s2ac(p_batch_u, g_batch_u, sigma, alpha)
+
+                stein_forces = jax.vmap(compute_batch_force_u)(particles_u, grad_q)
+                stein_forces_sg = jax.lax.stop_gradient(stein_forces)
+
+                particles_u_for_grad, _, _ = self._svgd_rollout_batch(
+                    policy_params, self.critic_models[0], critic_params, states, keys
+                )
+                surrogate_loss = -jnp.mean(
+                    jnp.sum(particles_u_for_grad * stein_forces_sg, axis=-1)
+                )
+
+                q_values = self._critic_values_particles(
+                    self.critic_models[0], critic_params, states, particles_a
+                )
+                particle_std = jnp.mean(jnp.std(particles_a, axis=1), axis=-1)
+                entropy_est = 0.5 * self._action_dim * (
+                    1.0 + jnp.log(2 * jnp.pi)
+                ) + jnp.log(particle_std + 1e-8)
+
+                # Additional metrics
+                stein_force_norm = jnp.mean(jnp.linalg.norm(stein_forces_sg, axis=-1))
+                grad_q_norm = jnp.mean(jnp.linalg.norm(grad_q, axis=-1))
+
+                if self._kernel_sigma_adaptive:
+                    sigmas = jax.vmap(self._mean_heuristic_sigma)(particles_u)
+                    mean_sigma = jnp.mean(sigmas)
+                else:
+                    mean_sigma = self._kernel_sigma if self._kernel_sigma else 0.0
+
+                metrics = {
+                    "q_mean": jnp.mean(q_values),
+                    "q_std": jnp.std(q_values),
+                    "entropy_mean": jnp.mean(entropy_est),
+                    "entropy_std": jnp.std(entropy_est),
+                    "log_prob_mean": -jnp.mean(entropy_est),
+                    "log_prob_std": jnp.std(entropy_est),
+                    "alpha": alpha,
+                    "particle_std": jnp.mean(particle_std),
+                    "stein_force_norm": stein_force_norm,
+                    "grad_q_norm": grad_q_norm,
+                    "kernel_sigma_mean": mean_sigma,
+                    "entropy_floor_penalty": 0.0,
+                }
+                return surrogate_loss, metrics
+
+            self._actor_value_and_grad = jax.jit(
+                jax.value_and_grad(_actor_loss_fn_single, argnums=0, has_aux=True)
+            )
+
+    def _role_for_critic_model(self, model: Model) -> str:
+        for i, c in enumerate(self.critic_models):
+            if c is model:
+                return f"critic_{i + 1}" if self._twin_critics else "critic"
+        for i, tc in enumerate(self.target_critic_models):
+            if tc is model:
+                return (
+                    f"target_critic_{i + 1}" if self._twin_critics else "target_critic"
+                )
+        return "critic"
+
+    def _make_q_wrt_u_scalar(self, critic_model, critic_params):
+        """
+        Return a callable q(u_vec, s) -> scalar that evaluates the critic(s)
+        at the action produced by u_vec via action transform:
+            a = action_scale * tanh(u_vec) + action_bias
+        """
+        # twin critics case
+        if isinstance(critic_model, (tuple, list)):
+
+            def q_wrt_u(u_vec, s):
+                a_vec = self._action_scale * jnp.tanh(u_vec) + self._action_bias
+                s_b = s[None, :]  # shape (1, S)
+                a_b = a_vec[None, :]  # shape (1, A)
+                v1, _, _ = critic_model[0].apply(
+                    critic_params[0],
+                    {"states": s_b, "taken_actions": a_b},
+                    self._role_for_critic_model(critic_model[0]),
+                )
+                v2, _, _ = critic_model[1].apply(
+                    critic_params[1],
+                    {"states": s_b, "taken_actions": a_b},
+                    self._role_for_critic_model(critic_model[1]),
+                )
+                return jnp.minimum(v1.reshape(()), v2.reshape(()))
+
+        else:
+            # single critic
+            def q_wrt_u(u_vec, s):
+                a_vec = self._action_scale * jnp.tanh(u_vec) + self._action_bias
+                s_b = s[None, :]
+                a_b = a_vec[None, :]
+                v, _, _ = critic_model.apply(
+                    critic_params,
+                    {"states": s_b, "taken_actions": a_b},
+                    self._role_for_critic_model(critic_model),
+                )
+                return v.reshape(())
+
+        return q_wrt_u
+
+    def act(self, states: jax.Array, timestep: int, timesteps: int) -> jax.Array:
+        states = jnp.atleast_2d(states)
+        if timestep < self._random_timesteps:
+            self._rng_key, subkey = random.split(self._rng_key)
+            actions = random.uniform(
+                subkey,
+                shape=(states.shape[0], self._action_dim),
+                minval=-1.0,
+                maxval=1.0,
+            )
+            return self._action_scale * actions + self._action_bias, None, {}
+
+        policy_params = self.policy.state_dict.params
+        if self._twin_critics:
+            critic_params = (
+                self.critic_models[0].state_dict.params,
+                self.critic_models[1].state_dict.params,
+            )
+            critic_model = (self.critic_models[0], self.critic_models[1])
+        else:
+            critic_params = self.critic_models[0].state_dict.params
+            critic_model = self.critic_models[0]
 
         self._rng_key, subkey = random.split(self._rng_key)
         keys = random.split(subkey, states.shape[0])
 
-        policy_params = self.policy.state_dict.params
-        critic_params = self.critic_model.state_dict.params
-
-        # returns: squashed_actions (batch, m, d), raw_actions (batch, m, d), log_prob (batch, m)
-        particles, raw_actions, log_prob = self._svgd_rollout_batch(
-            policy_params, self.critic_model, critic_params, states, keys
+        _, particles, log_prob = self._svgd_rollout_batch(
+            policy_params, critic_model, critic_params, states, keys
         )
-
-        # Choose return action (mean of particles); alternative: sample one particle randomly
-        actions = jnp.mean(particles, axis=1)  # (batch, d)
-        mean_log_prob = jnp.mean(log_prob, axis=1, keepdims=True)  # (batch, 1)
-
-        outputs = {"mean_actions": actions, "particles": particles}
-        # For single env interface, caller expects action shape (d,) not (1,d); SKRL handles batching.
-        return actions, mean_log_prob, outputs
-
+        mode = "softmax" if self.training else "max"
+        actions, selected_log_prob = self._select_action_from_particles(
+            mode, states, particles, log_prob
+        )
+        return actions, selected_log_prob, {}
 
     def record_transition(
         self,
@@ -291,19 +673,23 @@ class S2AC(Agent):
         pass
 
     def post_interaction(self, timestep: int, timesteps: int) -> None:
-        if self.memory is not None and len(self.memory) >= self._batch_size:
-            self.set_mode("train")
+        if timestep >= self._learning_starts:
             self._update(timestep, timesteps)
-            self.set_mode("eval")
-
         super().post_interaction(timestep, timesteps)
+
+    def _clip_grads(self, grads):
+        if self._grad_norm_clip is not None and self._grad_norm_clip > 0:
+            grads = optax.clip_by_global_norm(self._grad_norm_clip).update(grads, None)[
+                0
+            ]
+        return grads
 
     def _update(self, timestep: int, timesteps: int) -> None:
         if self.memory is None or len(self.memory) < self._batch_size:
             return
-        
-        # TODO: Add gradient steps?
-        # sample a batch from memory
+
+        self._update_counter += 1
+
         (
             sampled_states,
             sampled_actions,
@@ -311,207 +697,458 @@ class S2AC(Agent):
             sampled_next_states,
             sampled_terminated,
             sampled_truncated,
-        ) = self.memory.sample(names=self._tensors_names, batch_size=self._batch_size)[0]
+        ) = self.memory.sample(names=self._tensors_names, batch_size=self._batch_size)[
+            0
+        ]
 
         sampled_states = jnp.asarray(sampled_states)
         sampled_actions = jnp.asarray(sampled_actions)
-        sampled_rewards = jnp.asarray(sampled_rewards).squeeze(-1)
+        sampled_rewards = jnp.asarray(sampled_rewards).squeeze() * self._reward_scale
         sampled_next_states = jnp.asarray(sampled_next_states)
-        sampled_terminated = jnp.asarray(sampled_terminated).squeeze(-1)
-        sampled_truncated = jnp.asarray(sampled_truncated).squeeze(-1)
-        dones = jnp.clip(sampled_terminated + sampled_truncated, 0.0, 1.0)
+        sampled_terminated = jnp.asarray(sampled_terminated).squeeze()
+
+        self.track_data("Replay / Reward mean", float(jnp.mean(sampled_rewards)))
+        self.track_data("Replay / Reward std", float(jnp.std(sampled_rewards)))
+        self.track_data("Replay / Done fraction", float(jnp.mean(sampled_terminated)))
 
         policy_params = self.policy.state_dict.params
-        critic_params = self.critic_model.state_dict.params
-        target_model = self.target_critic if self.target_critic is not None else self.critic_model
-        target_params = target_model.state_dict.params
+        if self._twin_critics:
+            critic_params1 = self.critic_models[0].state_dict.params
+            critic_params2 = self.critic_models[1].state_dict.params
+            target_params1 = self.target_critic_models[0].state_dict.params
+            target_params2 = self.target_critic_models[1].state_dict.params
+        else:
+            critic_params = self.critic_models[0].state_dict.params
+            target_params = self.target_critic_models[0].state_dict.params
 
-        # sample next-state particles and log-probs
+        current_alpha = (
+            jnp.exp(self._log_alpha) if self._auto_entropy_tuning else self._alpha
+        )
+
         self._rng_key, subkey = random.split(self._rng_key)
         next_keys = random.split(subkey, sampled_next_states.shape[0])
-        next_particles, _, next_log_prob = self._svgd_rollout_batch(
-            policy_params, self.critic_model, critic_params, sampled_next_states, next_keys
-        )
+
+        if self._twin_critics:
+            _, next_particles, next_log_prob = self._svgd_rollout_batch(
+                policy_params,
+                (self.critic_models[0], self.critic_models[1]),
+                (critic_params1, critic_params2),
+                sampled_next_states,
+                next_keys,
+            )
+        else:
+            _, next_particles, next_log_prob = self._svgd_rollout_batch(
+                policy_params,
+                self.critic_models[0],
+                critic_params,
+                sampled_next_states,
+                next_keys,
+            )
         next_particles = jax.lax.stop_gradient(next_particles)
         next_log_prob = jax.lax.stop_gradient(next_log_prob)
 
-        # target critic values: evaluate Q_target for each next particle
-        target_q_values = self._critic_values_particles(target_model, target_params, sampled_next_states, next_particles)
-        target_q_mean = jnp.mean(target_q_values, axis=1)
-        entropy_term = jnp.mean(next_log_prob, axis=1)  # (batch,)
+        if self._twin_critics:
+            q1_next = self._critic_values_particles(
+                self.target_critic_models[0],
+                target_params1,
+                sampled_next_states,
+                next_particles,
+            )
+            q2_next = self._critic_values_particles(
+                self.target_critic_models[1],
+                target_params2,
+                sampled_next_states,
+                next_particles,
+            )
+            q_next = jnp.minimum(q1_next, q2_next)
+        else:
+            q_next = self._critic_values_particles(
+                self.target_critic_models[0],
+                target_params,
+                sampled_next_states,
+                next_particles,
+            )
 
-        targets = sampled_rewards + self._discount * (1.0 - dones) * (target_q_mean - self._alpha * entropy_term)
+        if self._use_soft_q_backup:
+            v_next = current_alpha * jax.scipy.special.logsumexp(
+                q_next / current_alpha, axis=1
+            ) - current_alpha * jnp.log(float(self._num_particles))
+        else:
+            v_next = jnp.mean(q_next - current_alpha * next_log_prob, axis=1)
+
+        targets = sampled_rewards + self._discount * (1.0 - sampled_terminated) * v_next
         targets = jax.lax.stop_gradient(targets)
 
-        target_stats = {
-            "target_q_mean": jnp.mean(target_q_mean),
-            "target_q_std": jnp.std(target_q_mean),
-            "entropy_term_mean": jnp.mean(entropy_term),
-            "entropy_term_std": jnp.std(entropy_term),
-            "reward_mean": jnp.mean(sampled_rewards),
-            "reward_std": jnp.std(sampled_rewards),
-            "done_fraction": jnp.mean(dones),
-        }
-
-        # === Critic update ===
-        def critic_loss_fn(params):
-            predicted = self._critic_values_single(self.critic_model, params, sampled_states, sampled_actions)
-            loss = jnp.mean((predicted - targets) ** 2)
-            metrics = {
-                "prediction_mean": jnp.mean(predicted),
-                "prediction_std": jnp.std(predicted),
-            }
-            return loss, metrics
-
-        (critic_loss, critic_metrics), critic_grad = jax.value_and_grad(critic_loss_fn, has_aux=True)(critic_params)
-        if config.jax.is_distributed:
-            critic_grad = self.critic_model.reduce_parameters(critic_grad)
-        critic_grad_norm = _pytree_l2_norm(critic_grad)
-        self.critic_optimizer = self.critic_optimizer.step(critic_grad, self.critic_model, self._critic_lr)
-
-        critic_params = self.critic_model.state_dict.params
-
-        # === Actor update ===
-        self._rng_key, subkey = random.split(self._rng_key)
-        actor_keys = random.split(subkey, sampled_states.shape[0])
-
-        def actor_loss_fn(policy_p, keys):
-            particles, _, log_prob = self._svgd_rollout_batch(
-                policy_p, self.critic_model, critic_params, sampled_states, keys
+        # Critic Update
+        if self._twin_critics:
+            (critic_loss, critic_metrics), (grad1, grad2) = self._critic_value_and_grad(
+                critic_params1, critic_params2, sampled_states, sampled_actions, targets
             )
-            q_values = self._critic_values_particles(self.critic_model, critic_params, sampled_states, particles)
-            q_mean = jnp.mean(q_values, axis=1)
-            entropy = jnp.mean(log_prob, axis=1)
-            # We minimize alpha * H - E[Q] (so gradient ascent on Q + alpha H)
-            loss = jnp.mean(self._alpha * entropy - q_mean)
-            metrics = {
-                "q_mean": jnp.mean(q_mean),
-                "q_std": jnp.std(q_mean),
-                "entropy_mean": jnp.mean(entropy),
-                "entropy_std": jnp.std(entropy),
-                "log_prob_mean": jnp.mean(log_prob),
-                "log_prob_std": jnp.std(log_prob),
-                "particle_std": jnp.mean(jnp.std(particles, axis=1)),
-            }
-            return loss, metrics
+            if config.jax.is_distributed:
+                grad1 = self.critic_models[0].reduce_parameters(grad1)
+                grad2 = self.critic_models[1].reduce_parameters(grad2)
 
-        (actor_loss, actor_metrics), actor_grad = jax.value_and_grad(actor_loss_fn, has_aux=True)(policy_params, actor_keys)
-        if config.jax.is_distributed:
-            actor_grad = self.policy.reduce_parameters(actor_grad)
-        actor_grad_norm = _pytree_l2_norm(actor_grad)
-        self.policy_optimizer = self.policy_optimizer.step(actor_grad, self.policy, self._actor_lr)
+            grad1 = self._clip_grads(grad1)
+            grad2 = self._clip_grads(grad2)
 
-        self._update_steps += 1
-        if self.target_critic is not None and self._update_steps % self._critic_target_update_interval == 0:
-            self.target_critic.update_parameters(self.critic_model, polyak=self._tau)
+            self.critic_optimizer_1 = self.critic_optimizer_1.step(
+                grad1, self.critic_models[0], self._critic_lr
+            )
+            self.critic_optimizer_2 = self.critic_optimizer_2.step(
+                grad2, self.critic_models[1], self._critic_lr
+            )
 
-        if self.write_interval > 0:
-            log_values = {
-                "Loss / Critic loss": critic_loss,
-                "Loss / Policy loss": actor_loss,
-                "Grad / Critic L2": critic_grad_norm,
-                "Grad / Policy L2": actor_grad_norm,
-                "Targets / Q mean": target_stats["target_q_mean"],
-                "Targets / Q std": target_stats["target_q_std"],
-                "Targets / Entropy mean": target_stats["entropy_term_mean"],
-                "Targets / Entropy std": target_stats["entropy_term_std"],
-                "Replay / Reward mean": target_stats["reward_mean"],
-                "Replay / Reward std": target_stats["reward_std"],
-                "Replay / Done fraction": target_stats["done_fraction"],
-                "Policy / Q mean": actor_metrics["q_mean"],
-                "Policy / Q std": actor_metrics["q_std"],
-                "Policy / Entropy mean": actor_metrics["entropy_mean"],
-                "Policy / Entropy std": actor_metrics["entropy_std"],
-                "Policy / LogProb mean": actor_metrics["log_prob_mean"],
-                "Policy / LogProb std": actor_metrics["log_prob_std"],
-                "Policy / Particle std": actor_metrics["particle_std"],
-                "Critic / Prediction mean": critic_metrics["prediction_mean"],
-                "Critic / Prediction std": critic_metrics["prediction_std"],
-                "Train / Update steps": float(self._update_steps),
-            }
-            for name, value in log_values.items():
-                self.track_data(name, float(value))
+            critic_params1 = self.critic_models[0].state_dict.params
+            critic_params2 = self.critic_models[1].state_dict.params
+        else:
+            (critic_loss, critic_metrics), critic_grad = self._critic_value_and_grad(
+                critic_params, sampled_states, sampled_actions, targets
+            )
+            if config.jax.is_distributed:
+                critic_grad = self.critic_models[0].reduce_parameters(critic_grad)
 
-    # === Helper functions ===
+            critic_grad = self._clip_grads(critic_grad)
+
+            self.critic_optimizer = self.critic_optimizer.step(
+                critic_grad, self.critic_models[0], self._critic_lr
+            )
+            critic_params = self.critic_models[0].state_dict.params
+
+        # Actor Update (only every actor_update_frequency steps - delayed policy updates)
+        actor_loss = 0.0
+        actor_metrics = None
+        actor_grad_norm = 0.0
+
+        if self._update_counter % self._actor_update_frequency == 0:
+            self._rng_key, subkey = random.split(self._rng_key)
+            actor_keys = random.split(subkey, sampled_states.shape[0])
+            log_alpha_for_actor = (
+                self._log_alpha if self._auto_entropy_tuning else jnp.log(self._alpha)
+            )
+
+            if self._twin_critics:
+                (actor_loss, actor_metrics), actor_grad = self._actor_value_and_grad(
+                    policy_params,
+                    critic_params1,
+                    critic_params2,
+                    sampled_states,
+                    actor_keys,
+                    log_alpha_for_actor,
+                )
+            else:
+                (actor_loss, actor_metrics), actor_grad = self._actor_value_and_grad(
+                    policy_params,
+                    critic_params,
+                    sampled_states,
+                    actor_keys,
+                    log_alpha_for_actor,
+                )
+
+            if config.jax.is_distributed:
+                actor_grad = self.policy.reduce_parameters(actor_grad)
+
+            actor_grad = self._clip_grads(actor_grad)
+
+            self.policy_optimizer = self.policy_optimizer.step(
+                actor_grad, self.policy, self._actor_lr
+            )
+
+            actor_grad_norm = self._pytree_l2_norm(actor_grad)
+
+            # Alpha Update (only when actor updates)
+            if self._auto_entropy_tuning:
+                log_prob_mean = jax.lax.stop_gradient(actor_metrics["log_prob_mean"])
+                alpha_loss, alpha_grad = self._alpha_value_and_grad(
+                    self._log_alpha, log_prob_mean
+                )
+                updates, self.alpha_opt_state = self.alpha_optimizer.update(
+                    alpha_grad, self.alpha_opt_state, params=self._log_alpha
+                )
+                self._log_alpha = optax.apply_updates(self._log_alpha, updates)
+                self._log_alpha = jnp.clip(self._log_alpha, -5.0, 2.0)
+
+        # Target network update
+        if timestep % self._critic_target_update_interval == 0:
+            for critic, target in zip(self.critic_models, self.target_critic_models):
+                target.update_parameters(critic, polyak=self._tau)
+
+        if self._twin_critics:
+            critic_grad_norm = (
+                self._pytree_l2_norm(grad1) + self._pytree_l2_norm(grad2)
+            ) / 2.0
+        else:
+            critic_grad_norm = self._pytree_l2_norm(critic_grad)
+
+        self.track_data("Reward / Batch Mean", float(jnp.mean(sampled_rewards)))
+        self.track_data("Reward / Batch Max", float(jnp.max(sampled_rewards)))
+
+        self.track_data("Loss / Critic loss", float(critic_loss))
+        self.track_data("Loss / Actor loss", float(actor_loss))
+
+        self.track_data("Coefficient / Alpha", float(current_alpha))
+
+        self.track_data("Grad / Critic L2", float(critic_grad_norm))
+        self.track_data("Grad / Actor L2", float(actor_grad_norm))
+
+        if actor_metrics is not None:
+            self.track_data("Loss / Alpha loss", float(alpha_loss))
+            self.track_data(
+                "Policy / Entropy mean", float(actor_metrics["entropy_mean"])
+            )
+            self.track_data("Policy / Entropy std", float(actor_metrics["entropy_std"]))
+            self.track_data(
+                "Policy / Log prob mean", float(actor_metrics["log_prob_mean"])
+            )
+            self.track_data(
+                "Policy / Log prob std", float(actor_metrics["log_prob_std"])
+            )
+            self.track_data(
+                "Policy / Particle std", float(actor_metrics["particle_std"])
+            )
+            self.track_data(
+                "Policy / Stein Force Norm", float(actor_metrics["stein_force_norm"])
+            )
+            self.track_data("Policy / Grad Q Norm", float(actor_metrics["grad_q_norm"]))
+            self.track_data(
+                "Policy / Kernel Sigma Mean", float(actor_metrics["kernel_sigma_mean"])
+            )
+
+        self.track_data("Targets / Q mean", float(jnp.mean(targets)))
+        self.track_data("Targets / Q std", float(jnp.std(targets)))
+        self.track_data("Targets / Reward mean", float(jnp.mean(sampled_rewards)))
+        self.track_data("Targets / Reward std", float(jnp.std(sampled_rewards)))
+
+        self.track_data(
+            "Critic / Prediction Mean", float(critic_metrics["prediction_mean"])
+        )
+        self.track_data(
+            "Critic / Prediction Std", float(critic_metrics["prediction_std"])
+        )
+
     def _critic_values_single(self, model: Model, params, states, actions):
-        role = self._critic_role if model is self.critic_model else self._target_role
-        values, _, _ = model.apply(params, {"states": states, "taken_actions": actions}, role)
-        if values.ndim > 1 and values.shape[-1] == 1:
-            values = jnp.squeeze(values, axis=-1)
+        """Get Q-values for state-action pairs with robust squeeze."""
+        role = self._role_for_critic_model(model)
+        values, _, _ = model.apply(
+            params, {"states": states, "taken_actions": actions}, role
+        )
+        if values.ndim > 1:
+            return values.squeeze(-1)
+        return values
+
+    def _critic_value_for_actions(self, model: Model, params, state, actions):
+        """
+        Computes Q(s, a) where 'state' is (s_dim,) and 'actions' is (m, a_dim).
+        """
+        # Since SKRL models expect batch dimensions for "states" and "taken_actions",
+        # we virtually broadcast state to match actions batch size.
+        m = actions.shape[0]
+        # (S) -> (M, S)
+        if state.ndim == 1:
+            state_broadcast = jnp.broadcast_to(state, (m, state.shape[0]))
+        else:
+            # If state passed as (1, S)
+            state_broadcast = jnp.broadcast_to(state, (m, state.shape[1]))
+
+        role = self._role_for_critic_model(model)
+        values, _, _ = model.apply(
+            params, {"states": state_broadcast, "taken_actions": actions}, role
+        )
+
+        if values.ndim > 1:
+            return values.squeeze(-1)
         return values
 
     def _critic_values_particles(self, model: Model, params, states, particles):
-        batch, num_particles, action_dim = particles.shape
-        tiled_states = jnp.repeat(states[:, None, :], num_particles, axis=1).reshape(batch * num_particles, -1)
-        flat_actions = particles.reshape(batch * num_particles, action_dim)
-        role = self._critic_role if model is self.critic_model else self._target_role
-        values, _, _ = model.apply(params, {"states": tiled_states, "taken_actions": flat_actions}, role)
-        return values.reshape(batch, num_particles)
+        """
+        states: (Batch, State_Dim)
+        particles: (Batch, Num_Particles, Action_Dim)
+        Returns: (Batch, Num_Particles)
+        """
+        role = self._role_for_critic_model(model)
+        batch_size = states.shape[0]
+        num_particles = particles.shape[1]
+        state_dim = states.shape[1]
 
-    def _svgd_rollout_batch(self, policy_params, critic_model: Model, critic_params, states, keys):
+        # states_expanded: (Batch, Num_Particles, State_Dim)
+        states_expanded = jnp.broadcast_to(
+            states[:, None, :], (batch_size, num_particles, state_dim)
+        )
+
+        states_flat = states_expanded.reshape(-1, state_dim)
+        particles_flat = particles.reshape(-1, particles.shape[-1])
+
+        # Single forward pass through the model
+        out, _, _ = model.apply(
+            params, {"states": states_flat, "taken_actions": particles_flat}, role
+        )
+
+        # Reshape back to (Batch, Num_Particles)
+        result = out.reshape(batch_size, num_particles)
+        return result
+
+    def _svgd_rollout_batch(
+        self, policy_params, critic_model, critic_params, states, keys
+    ):
+        """
+        Batched SVGD rollout using vmap.
+        The vmap is applied once at call time for flexibility with different critic configs.
+        """
+
         def single(state, key):
-            return self._svgd_rollout_single(policy_params, critic_model, critic_params, state, key)
+            return self._svgd_rollout_single(
+                policy_params, critic_model, critic_params, state, key
+            )
 
         return jax.vmap(single)(states, keys)
 
-    def _svgd_rollout_single(self, policy_params, critic_model: Model, critic_params, state, key):
+    def _svgd_rollout_single(
+        self, policy_params, critic_model, critic_params, state, key
+    ):
         """
-        Returns:
-          squashed: (m, d) - actions after tanh and scaling (to send to env)
-          raw_actions: (m, d) - pre-squash actions (needed for logqL and correction)
-          log_prob: (m,) - log density (log q_L(u) + tanh-correction) per particle
+        Perform SVGD rollout for a single state (vmapped over batch in _svgd_rollout_batch).
+        Returns: (final_u, final_a, log_prob)
         """
-         
-        state = jnp.reshape(state, (-1,))
-        policy_inputs = {"states": state[None, :]}
-        mean_actions, log_std, _ = self.policy.apply(policy_params, policy_inputs, self._policy_role)
-        mean_actions = jnp.reshape(mean_actions, (self._action_dim,))
-        log_std = jnp.reshape(log_std, (self._action_dim,))
+        mean, log_std, _ = self.policy.apply(
+            policy_params, {"states": state[None, ...]}, "policy"
+        )
+        mean = mean[0]
+        log_std = log_std[0]
         std = jnp.exp(log_std)
 
-        eps = random.normal(key, (self._particles, self._action_dim))
-        a0 = mean_actions[None, :] + std[None, :] * eps # (m, d)
+        key, subkey = random.split(key)
+        noise = random.normal(subkey, shape=(self._particles, self._action_dim))
+        u0 = mean + std * noise  # (P, A)
 
-        actions = a0
-        all_a = []
-        all_grad = []
-        for _ in range(self._svgd_steps):
-            # Compute gradients $\nabla_a Q(s, a)$ for each particle
-            grad_q = action_score_from_Q(
-                lambda params, s, a: self._critic_value_for_actions(critic_model, params, s, a),
-                critic_params,
-                state,
-                actions,
-                self._alpha,
-            ) # (m, d)
-            all_a.append(actions)
-            all_grad.append(grad_q)
-            phi = svgd_vector_field(actions, grad_q, self._kernel_sigma) # (m, d)
-            actions = actions + self._svgd_step_size * phi
+        q_wrt_u_scalar = self._make_q_wrt_u_scalar(critic_model, critic_params)
 
-        # closed form log q_L from Appendix H (s2ac paper)
-        logqL = compute_logqL_closed_form(
-            a0,
-            tuple(all_a),
-            tuple(all_grad),
-            mean_actions,
-            log_std,
-            self._svgd_step_size,
-            self._kernel_sigma,
-            self._alpha,
-        ) # (m,)
+        # initial kernel sigma
+        if (
+            self._kernel_sigma_adaptive
+            or self._kernel_sigma is None
+            or self._kernel_sigma <= 0
+        ):
+            sigma0 = self._mean_heuristic_sigma(u0)
+        else:
+            sigma0 = self._kernel_sigma
 
-        # tanh squash correction: log_prob = logqL + sum log |d tanh/du|
-        # where log |d tanh/du| = log(1 - tanh(u)^2) = 2*(log(2) - u - softplus(-2u))
-        # actions here are pre-squash u
-        logp_tanh = jnp.sum(2.0 * (jnp.log(2.0) - actions - jnn.softplus(-2.0 * actions)), axis=-1)
-        log_prob = logqL + logp_tanh
-        squashed = self._action_scale * jnp.tanh(actions)
+        alpha = jnp.exp(self._log_alpha) if self._auto_entropy_tuning else self._alpha
+        eps = self._svgd_step_size
+        T = int(self._svgd_steps)
 
-        return squashed, actions, log_prob
+        # step function for lax.scan: carry = (u, sigma), out = (u_pre, grad_q_pre, sigma_pre)
+        def svgd_step(carry, _):
+            u, sigma = carry  # u: (P, A)
+            # compute grad_q (P, A)
+            grad_q = jax.vmap(jax.grad(q_wrt_u_scalar), in_axes=(0, None))(u, state)
+            # optionally stop grad on score
+            grad_q_for_phi = (
+                jax.lax.stop_gradient(grad_q) if self._stop_grad_svgd_score else grad_q
+            )
+            phi = svgd_vector_field_s2ac(u, grad_q_for_phi, sigma, alpha)
+            u_next = u + eps * phi
+            sigma_next = (
+                self._mean_heuristic_sigma(u_next)
+                if self._kernel_sigma_adaptive
+                else sigma
+            )
+            out = (u, grad_q, sigma)  # store pre-update u, grad, sigma
+            return (u_next, sigma_next), out
 
-    def _critic_value_for_actions(self, model: Model, params, state, actions):
-        repeated_states = jnp.repeat(state[None, :], actions.shape[0], axis=0)
-        role = self._critic_role if model is self.critic_model else self._target_role
-        values, _, _ = model.apply(params, {"states": repeated_states, "taken_actions": actions}, role)
-        return values.reshape(-1)
+        # run scan
+        (u_final, _), scan_outs = lax.scan(svgd_step, (u0, sigma0), None, length=T)
+        # scan_outs is a tuple (u_traj, gradQ_traj, sigmas_traj) with shapes:
+        # u_traj: (T, P, A), gradQ_traj: (T, P, A), sigmas_traj: (T,)
+        u_traj, gradQ_traj, sigmas_traj = scan_outs
+
+        # final scaled action
+        final_a = self._action_scale * jnp.tanh(u_final) + self._action_bias
+
+        # compute closed-form log q_L based on u-trajectory; a0 = initial u
+        log_prob = compute_logqL_closed_form(
+            a0=u0,  # initial u
+            all_a_list=u_traj,  # (T, P, A)
+            all_gradQ_list=gradQ_traj,  # (T, P, A)
+            mu0=mean,
+            logstd0=log_std,
+            eps=eps,
+            sigma_list=sigmas_traj,
+            alpha=alpha,
+        )
+
+        return u_final, final_a, log_prob
+
+    def _critic_values_for_actions_twin(self, models, params_tuple, state, actions):
+        q1 = self._critic_value_for_actions(models[0], params_tuple[0], state, actions)
+        q2 = self._critic_value_for_actions(models[1], params_tuple[1], state, actions)
+        return jnp.minimum(q1, q2)
+
+    def _mean_heuristic_sigma(
+        self, actions: jnp.ndarray, h_min: float = 1e-3
+    ) -> jnp.ndarray:
+        return median_heuristic_sigma(actions, h_min)
+
+    def _select_action_from_particles(
+        self, mode: str, states: jax.Array, particles: jax.Array, log_prob: jax.Array
+    ):
+        batch, m, _ = particles.shape
+        mode = (mode or "random").lower()
+
+        if mode == "mean":
+            return jnp.mean(particles, axis=1), jnp.mean(
+                log_prob, axis=1, keepdims=True
+            )
+
+        if mode == "random":
+            self._rng_key, subkey = random.split(self._rng_key)
+            idx = random.randint(subkey, (batch,), minval=0, maxval=m)
+            actions = particles[jnp.arange(batch), idx]
+            selected_log_prob = log_prob[jnp.arange(batch), idx][:, None]
+            return actions, selected_log_prob
+
+        # Evaluate Q-values for selection (Max or Softmax)
+        if self._twin_critics:
+            q_vals = jnp.minimum(
+                self._critic_values_particles(
+                    self.critic_models[0],
+                    self.critic_models[0].state_dict.params,
+                    states,
+                    particles,
+                ),
+                self._critic_values_particles(
+                    self.critic_models[1],
+                    self.critic_models[1].state_dict.params,
+                    states,
+                    particles,
+                ),
+            )
+        else:
+            q_vals = self._critic_values_particles(
+                self.critic_models[0],
+                self.critic_models[0].state_dict.params,
+                states,
+                particles,
+            )
+
+        if mode == "max":
+            idx = jnp.argmax(q_vals, axis=1)
+            actions = particles[jnp.arange(batch), idx]
+            selected_log_prob = log_prob[jnp.arange(batch), idx][:, None]
+            return actions, selected_log_prob
+
+        if mode == "softmax":
+            alpha = (
+                jnp.exp(self._log_alpha) if self._auto_entropy_tuning else self._alpha
+            )
+            # pass logits directly to categorical for numerical stability
+            logits = q_vals / (alpha + 1e-12)
+            self._rng_key, subkey = random.split(self._rng_key)
+            idx = random.categorical(subkey, logits, axis=1)
+            actions = particles[jnp.arange(batch), idx]
+            selected_log_prob = log_prob[jnp.arange(batch), idx][:, None]
+            return actions, selected_log_prob
+
+        return jnp.mean(particles, axis=1), jnp.mean(log_prob, axis=1, keepdims=True)
+
+    def _pytree_l2_norm(self, tree):
+        """Compute L2 norm of a pytree of arrays using optax for efficiency."""
+        return optax.global_norm(tree)

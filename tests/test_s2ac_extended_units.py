@@ -8,7 +8,7 @@ from agent.s2ac.utils import (
     action_score_from_Q,
     svgd_vector_field,
     compute_logqL_closed_form,
-    logq0_isotropic_gaussian,
+    # logq0_isotropic_gaussian,
 )
 
 # Enable x64 for precision in tests
@@ -110,20 +110,20 @@ def test_svgd_vector_field_direction():
     assert jnp.allclose(phi, -actions)
 
 
-def test_logq0_isotropic_gaussian():
-    """Test log probability of isotropic Gaussian."""
-    key = random.PRNGKey(4)
-    m = 3
-    d = 2
+# def test_logq0_isotropic_gaussian():
+#     """Test log probability of isotropic Gaussian."""
+#     key = random.PRNGKey(4)
+#     m = 3
+#     d = 2
 
-    a0 = jnp.zeros((m, d))
-    mu = jnp.zeros((d,))
-    logstd = jnp.zeros((d,))  # std = 1
+#     a0 = jnp.zeros((m, d))
+#     mu = jnp.zeros((d,))
+#     logstd = jnp.zeros((d,))  # std = 1
 
-    # log pdf of N(0, I) at 0 is -d/2 * log(2pi)
-    expected_val = -0.5 * d * jnp.log(2 * jnp.pi)
+#     # log pdf of N(0, I) at 0 is -d/2 * log(2pi)
+#     expected_val = -0.5 * d * jnp.log(2 * jnp.pi)
 
-    logq = logq0_isotropic_gaussian(a0, mu, logstd)
+#     logq = logq0_isotropic_gaussian(a0, mu, logstd)
 
-    assert logq.shape == (m,)
-    assert jnp.allclose(logq, expected_val)
+#     assert logq.shape == (m,)
+#     assert jnp.allclose(logq, expected_val)

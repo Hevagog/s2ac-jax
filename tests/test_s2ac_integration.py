@@ -246,8 +246,8 @@ def make_dummy_policy_and_critic(action_dim, state_dim):
             if role == "policy":
                 s = inputs["states"].reshape(-1)
                 # mean = linear in states, logstd = small constant
-                mean = jnp.zeros((action_dim,)) + 0.0
-                logstd = jnp.full((action_dim,), -1.0)  # std ~ 0.367
+                mean = jnp.zeros((1, action_dim)) + 0.0
+                logstd = jnp.full((1, action_dim), -1.0)  # std ~ 0.367
                 return mean, logstd, {}
             else:
                 # critic: expect inputs {"states": (N, state_dim), "taken_actions": (N, action_dim)}

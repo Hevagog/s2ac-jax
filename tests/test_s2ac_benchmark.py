@@ -36,12 +36,22 @@ def agent_setup():
         device=env.device,
         clip_actions=True,
     )
-    models["critic"] = Critic_MLP(
+    models["critic_1"] = Critic_MLP(
         observation_space=env.observation_space,
         action_space=env.action_space,
         device=env.device,
     )
-    models["target_critic"] = Target_Critic_MLP(
+    models["critic_2"] = Critic_MLP(
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        device=env.device,
+    )
+    models["target_critic_1"] = Target_Critic_MLP(
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        device=env.device,
+    )
+    models["target_critic_2"] = Target_Critic_MLP(
         observation_space=env.observation_space,
         action_space=env.action_space,
         device=env.device,

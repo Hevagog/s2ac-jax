@@ -33,56 +33,55 @@ print(f"[S2AC] Using JAX device: {device}")
 
 with jax.default_device(device):
     env = brax.envs.create(
-        "inverted_pendulum", episode_length=1000, batch_size=8192, backend="mjx"
+        "inverted_pendulum", episode_length=1000, batch_size=4, backend="mjx"
     )
 
 
 env = wrap_env(env, verbose=False)
-if hasattr(env, "_device"):
-    env._device = device
-elif hasattr(env, "device"):
-    env.device = device
 
-memory = RandomMemory(memory_size=2000, num_envs=env.num_envs, device=env.device)
+env_device = getattr(env, "device", getattr(env, "_device", device))
+
+memory = RandomMemory(memory_size=100_000, num_envs=env.num_envs, device=env_device)
 
 models = {}
 models["policy"] = Policy_MLP(
     observation_space=env.observation_space,
     action_space=env.action_space,
-    device=env.device,
+    device=env_device,
     clip_actions=True,
     clip_log_std=True,
-    min_log_std=-20,
+    min_log_std=-5,
     max_log_std=2,
-    reduction="mean",
+    reduction="sum",
 )
 models["policy"].init_state_dict("policy")
-models["critic"] = Critic_MLP(
+models["critic_1"] = Critic_MLP(
     observation_space=env.observation_space,
     action_space=env.action_space,
-    device=env.device,
-    clip_actions=True,
-    clip_log_std=True,
-    min_log_std=-20,
-    max_log_std=2,
-    reduction="mean",
+    device=env_device,
 )
-models["critic"].init_state_dict("critic")
-models["target_critic"] = Target_Critic_MLP(
+models["critic_1"].init_state_dict("critic_1")
+models["critic_2"] = Critic_MLP(
     observation_space=env.observation_space,
     action_space=env.action_space,
-    device=env.device,
-    clip_actions=True,
-    clip_log_std=True,
-    min_log_std=-20,
-    max_log_std=2,
-    reduction="mean",
+    device=env_device,
 )
-models["target_critic"].init_state_dict("target_critic")
+models["critic_2"].init_state_dict("critic_2")
+models["target_critic_1"] = Target_Critic_MLP(
+    observation_space=env.observation_space,
+    action_space=env.action_space,
+    device=env_device,
+)
+models["target_critic_1"].init_state_dict("target_critic_1")
+models["target_critic_2"] = Target_Critic_MLP(
+    observation_space=env.observation_space,
+    action_space=env.action_space,
+    device=env_device,
+)
+models["target_critic_2"].init_state_dict("target_critic_2")
 
 cfg_agent = S2AC_DEFAULT_CONFIG.copy()
-cfg_agent["particles"] = 24
-cfg_agent["svgd_steps"] = 3
+
 
 agent = S2AC(
     models=models,
@@ -90,10 +89,10 @@ agent = S2AC(
     cfg=cfg_agent,
     observation_space=env.observation_space,
     action_space=env.action_space,
-    device=env.device,
+    device=env_device,
 )
 
-cfg = {"timesteps": 80_000, "headless": True}
+cfg = {"timesteps": 1_000_000, "headless": True}
 trainer = SequentialTrainer(env=env, agents=agent, cfg=cfg)
 trainer.train()
 

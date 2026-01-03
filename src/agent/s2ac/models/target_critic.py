@@ -26,23 +26,25 @@ class Target_Critic_MLP(GaussianMixin, Model):
     def __call__(self, inputs, role):
         states = jnp.atleast_2d(inputs["states"])
         actions = inputs.get("taken_actions")
+        batch_size = states.shape[0]
         if actions is None:
-            actions = jnp.zeros((states.shape[0], self.num_actions), dtype=states.dtype)
+            actions = jnp.zeros((batch_size, self.num_actions), dtype=states.dtype)
         else:
             actions = jnp.atleast_2d(actions)
-            if actions.shape[0] != states.shape[0]:
+            if actions.shape[0] != batch_size:
                 if actions.shape[0] == 1:
-                    actions = jnp.repeat(actions, states.shape[0], axis=0)
+                    # Use broadcast_to instead of repeat for better performance
+                    actions = jnp.broadcast_to(actions, (batch_size, actions.shape[1]))
                 else:
                     raise ValueError("Batch size mismatch between states and actions")
             actions = actions.astype(states.dtype)
 
         x = jnp.concatenate([states, actions], axis=-1)
-        x = nn.Dense(64)(x)
+        x = nn.Dense(256, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(x)
         x = nn.relu(x)
-        x = nn.Dense(32)(x)
+        x = nn.Dense(256, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(x)
         x = nn.relu(x)
-        q = nn.Dense(1)(x)
+        q = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(x)
         log_std_parameter = self.param(
             "log_std_parameter", lambda _: jnp.zeros(self.num_actions)
         )

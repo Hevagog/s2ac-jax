@@ -1,2 +1,6 @@
 runs/*
 *.pyc
+*.mp4
+*.csv
+__pycache__/
+

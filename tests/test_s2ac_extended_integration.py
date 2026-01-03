@@ -40,12 +40,22 @@ def agent(mock_env):
         device=mock_env.device,
         clip_actions=True,
     )
-    models["critic"] = Critic_MLP(
+    models["critic_1"] = Critic_MLP(
         observation_space=mock_env.observation_space,
         action_space=mock_env.action_space,
         device=mock_env.device,
     )
-    models["target_critic"] = Target_Critic_MLP(
+    models["critic_2"] = Critic_MLP(
+        observation_space=mock_env.observation_space,
+        action_space=mock_env.action_space,
+        device=mock_env.device,
+    )
+    models["target_critic_1"] = Target_Critic_MLP(
+        observation_space=mock_env.observation_space,
+        action_space=mock_env.action_space,
+        device=mock_env.device,
+    )
+    models["target_critic_2"] = Target_Critic_MLP(
         observation_space=mock_env.observation_space,
         action_space=mock_env.action_space,
         device=mock_env.device,
@@ -81,8 +91,10 @@ def test_agent_initialization(agent):
     """Test that the agent initializes correctly."""
     assert agent is not None
     assert agent.policy is not None
-    assert agent.critic_model is not None
-    assert agent.target_critic is not None
+    assert agent.critic_models is not None
+    assert len(agent.critic_models) == 2
+    assert agent.target_critics is not None
+    assert len(agent.target_critics) == 2
     assert agent._particles == 4
 
 
@@ -133,6 +145,9 @@ def test_agent_update_changes_params(agent, mock_env):
     initial_critic_params = jax.tree_util.tree_map(
         lambda x: x.copy(), agent.critic_model.state_dict.params
     )
+
+    # Ensure actor updates on every step for this test
+    agent._actor_update_frequency = 1
 
     # Perform update
     agent._update(timestep=100, timesteps=1000)
