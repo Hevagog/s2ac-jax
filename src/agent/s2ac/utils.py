@@ -44,20 +44,26 @@ def _get_sqdist_matrix_optimized(x):
 
 
 @jit
-def median_heuristic_sigma(actions, h_min=1e-3):
+def median_heuristic_sigma(actions, h_min=1e-3, h_max=10.0):
     """
     Median heuristic for RBF bandwidth (returns bandwidth sigma).
+    Includes upper bound to prevent explosion when particles diverge.
     """
     m = actions.shape[0]
     dist_sq = _get_sqdist_matrix_optimized(actions)
     # mask out diagonal by adding a large number there
     mask = 1.0 - jnp.eye(m)
     maxval = jnp.max(dist_sq)
+
+    maxval = jnp.where(jnp.isfinite(maxval), maxval, 1e6)
     median_sq = jnp.median(dist_sq + (1.0 - mask) * maxval)
+
+    median_sq = jnp.where(jnp.isfinite(median_sq), median_sq, 1.0)
     # paper uses something like h = median_sq / (2 log m) ; we return sigma = sqrt(h)
     h = jnp.maximum(median_sq / (2.0 * jnp.log(m + 1.0) + EPS), h_min * h_min)
     sigma = jnp.sqrt(h)
-    return jnp.maximum(sigma, h_min)
+
+    return jnp.clip(sigma, h_min, h_max)
 
 
 @jit
@@ -232,16 +238,26 @@ def compute_logqL_closed_form(
 
 
 @jit
-def svgd_vector_field_s2ac(actions, grad_q, sigma, alpha):
+def svgd_vector_field_s2ac(actions, grad_q, sigma, alpha, max_phi_norm=10.0):
     """
     SVGD vector field for S2AC.
     Wrapper around the optimized svgd_vector_field.
+    Includes clipping to prevent exploding updates.
 
     """
     # The score function is grad_a Q(a) / alpha
     # IMPORTANT: grad_q should be detached before calling this if you don't want
     # gradients to flow through the score function (standard SVGD).
-    inv_alpha = 1.0 / alpha
+    grad_q = jnp.where(jnp.isfinite(grad_q), grad_q, 0.0)
+    inv_alpha = 1.0 / (alpha + EPS)
     scores = grad_q * inv_alpha
+
+    scores = jnp.clip(scores, -100.0, 100.0)
     # Reuse the optimized calculation
-    return svgd_vector_field(actions, scores, sigma)
+    phi = svgd_vector_field(actions, scores, sigma)
+
+    phi_norm = jnp.linalg.norm(phi, axis=-1, keepdims=True)
+    phi = jnp.where(
+        phi_norm > max_phi_norm, phi * (max_phi_norm / (phi_norm + EPS)), phi
+    )
+    return phi

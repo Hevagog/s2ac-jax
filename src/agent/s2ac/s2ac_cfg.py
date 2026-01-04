@@ -6,7 +6,10 @@ S2AC_DEFAULT_CONFIG = {
     "svgd_step_size": 0.05,
     "kernel_sigma": None,
     "kernel_sigma_adaptive": True,
+    "kernel_sigma_max": 10.0,  
     "stop_grad_svgd_score": True,
+    "max_phi_norm": 10.0,  
+    "u_clip_bound": 5.0,  
 
     "use_soft_q_backup": True,
     
@@ -24,6 +27,7 @@ S2AC_DEFAULT_CONFIG = {
     "auto_entropy_tuning": True,
     "alpha": 0.2,
     "target_entropy": None,
+    "log_alpha_bounds": (-2.0, 2.0),  
 
     "reward_scale": 1.0,
     "random_timesteps": 1000,
@@ -36,7 +40,7 @@ S2AC_DEFAULT_CONFIG = {
     "experiment": {
         "directory": "",
         "experiment_name": "",
-        "write_interval": 250,
+        "write_interval": 100,
         "checkpoint_interval": 'auto',
         "store_separately": False,
         "wandb": False,

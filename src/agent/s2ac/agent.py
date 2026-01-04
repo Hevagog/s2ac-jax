@@ -50,7 +50,10 @@ class S2AC(Agent):
         self._svgd_step_size = self.cfg.get("svgd_step_size")
         self._kernel_sigma = self.cfg.get("kernel_sigma")
         self._kernel_sigma_adaptive = self.cfg.get("kernel_sigma_adaptive")
+        self._kernel_sigma_max = self.cfg.get("kernel_sigma_max", 10.0)
         self._stop_grad_svgd_score = self.cfg.get("stop_grad_svgd_score")
+        self._max_phi_norm = self.cfg.get("max_phi_norm", 10.0)
+        self._u_clip_bound = self.cfg.get("u_clip_bound", 5.0)
         self._use_soft_q_backup = self.cfg.get("use_soft_q_backup")
 
         self._batch_size = self.cfg.get("batch_size")
@@ -70,6 +73,7 @@ class S2AC(Agent):
         self._auto_entropy_tuning = self.cfg.get("auto_entropy_tuning")
         self._alpha = self.cfg.get("alpha")
         self._target_entropy = self.cfg.get("target_entropy")
+        self._log_alpha_bounds = self.cfg.get("log_alpha_bounds", (-2.0, 2.0))
 
         self._reward_scale = self.cfg.get("reward_scale")
         self._random_timesteps = self.cfg.get("random_timesteps")
@@ -678,6 +682,9 @@ class S2AC(Agent):
         super().post_interaction(timestep, timesteps)
 
     def _clip_grads(self, grads):
+        grads = jax.tree_util.tree_map(
+            lambda g: jnp.where(jnp.isfinite(g), g, 0.0), grads
+        )
         if self._grad_norm_clip is not None and self._grad_norm_clip > 0:
             grads = optax.clip_by_global_norm(self._grad_norm_clip).update(grads, None)[
                 0
@@ -769,13 +776,18 @@ class S2AC(Agent):
                 next_particles,
             )
 
+        q_next = jnp.where(jnp.isfinite(q_next), q_next, 0.0)
+
         if self._use_soft_q_backup:
+            # Clip q_next / alpha to prevent overflow in logsumexp
+            q_scaled = jnp.clip(q_next / (current_alpha + 1e-8), -50.0, 50.0)
             v_next = current_alpha * jax.scipy.special.logsumexp(
-                q_next / current_alpha, axis=1
+                q_scaled, axis=1
             ) - current_alpha * jnp.log(float(self._num_particles))
         else:
             v_next = jnp.mean(q_next - current_alpha * next_log_prob, axis=1)
 
+        v_next = jnp.where(jnp.isfinite(v_next), v_next, 0.0)
         targets = sampled_rewards + self._discount * (1.0 - sampled_terminated) * v_next
         targets = jax.lax.stop_gradient(targets)
 
@@ -858,14 +870,24 @@ class S2AC(Agent):
             # Alpha Update (only when actor updates)
             if self._auto_entropy_tuning:
                 log_prob_mean = jax.lax.stop_gradient(actor_metrics["log_prob_mean"])
+                log_prob_mean = jnp.where(
+                    jnp.isfinite(log_prob_mean), log_prob_mean, -1.0
+                )
                 alpha_loss, alpha_grad = self._alpha_value_and_grad(
                     self._log_alpha, log_prob_mean
                 )
+                alpha_grad = jnp.where(jnp.isfinite(alpha_grad), alpha_grad, 0.0)
                 updates, self.alpha_opt_state = self.alpha_optimizer.update(
                     alpha_grad, self.alpha_opt_state, params=self._log_alpha
                 )
                 self._log_alpha = optax.apply_updates(self._log_alpha, updates)
-                self._log_alpha = jnp.clip(self._log_alpha, -5.0, 2.0)
+
+                # Lower bound prevents scores from exploding (scores = grad_q / alpha)
+                self._log_alpha = jnp.clip(
+                    self._log_alpha,
+                    self._log_alpha_bounds[0],
+                    self._log_alpha_bounds[1],
+                )
 
         # Target network update
         if timestep % self._critic_target_update_interval == 0:
@@ -1035,17 +1057,23 @@ class S2AC(Agent):
         eps = self._svgd_step_size
         T = int(self._svgd_steps)
 
+        u_clip_bound = self._u_clip_bound
+
         # step function for lax.scan: carry = (u, sigma), out = (u_pre, grad_q_pre, sigma_pre)
         def svgd_step(carry, _):
             u, sigma = carry  # u: (P, A)
             # compute grad_q (P, A)
             grad_q = jax.vmap(jax.grad(q_wrt_u_scalar), in_axes=(0, None))(u, state)
+
+            grad_q = jnp.where(jnp.isfinite(grad_q), grad_q, 0.0)
             # optionally stop grad on score
             grad_q_for_phi = (
                 jax.lax.stop_gradient(grad_q) if self._stop_grad_svgd_score else grad_q
             )
             phi = svgd_vector_field_s2ac(u, grad_q_for_phi, sigma, alpha)
             u_next = u + eps * phi
+            # Clip particles to prevent explosion
+            u_next = jnp.clip(u_next, -u_clip_bound, u_clip_bound)
             sigma_next = (
                 self._mean_heuristic_sigma(u_next)
                 if self._kernel_sigma_adaptive
@@ -1085,7 +1113,7 @@ class S2AC(Agent):
     def _mean_heuristic_sigma(
         self, actions: jnp.ndarray, h_min: float = 1e-3
     ) -> jnp.ndarray:
-        return median_heuristic_sigma(actions, h_min)
+        return median_heuristic_sigma(actions, h_min, self._kernel_sigma_max)
 
     def _select_action_from_particles(
         self, mode: str, states: jax.Array, particles: jax.Array, log_prob: jax.Array

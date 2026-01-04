@@ -33,7 +33,7 @@ print(f"[S2AC] Using JAX device: {device}")
 
 with jax.default_device(device):
     env = brax.envs.create(
-        "inverted_pendulum", episode_length=1000, batch_size=4, backend="mjx"
+        "inverted_pendulum", episode_length=1000, batch_size=256, backend="mjx"
     )
 
 
@@ -92,7 +92,7 @@ agent = S2AC(
     device=env_device,
 )
 
-cfg = {"timesteps": 1_000_000, "headless": True}
+cfg = {"timesteps": 100_000, "headless": True}
 trainer = SequentialTrainer(env=env, agents=agent, cfg=cfg)
 trainer.train()
 
