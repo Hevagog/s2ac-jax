@@ -66,9 +66,7 @@ class Optimizer(PyTreeNode):
     def _create(cls, *, transformation, state, **kwargs):
         return cls(transformation=transformation, state=state, **kwargs)
 
-    def step(
-        self, grad: jax.Array, model: Model, lr: float | None = None
-    ) -> "Optimizer":
+    def step(self, grad: jax.Array, model: Model, lr: float | None = None) -> Optimizer:
         if lr is None:
             optimizer_state, model.state_dict = _step(
                 self.transformation, grad, self.state, model.state_dict

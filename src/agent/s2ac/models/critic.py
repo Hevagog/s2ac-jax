@@ -1,3 +1,5 @@
+from typing import Sequence
+
 import jax.numpy as jnp
 import flax.linen as nn
 
@@ -5,6 +7,22 @@ from skrl.models.jax import Model, GaussianMixin
 
 
 class Critic_MLP(GaussianMixin, Model):
+    """Q-value critic network for S2AC.
+
+    Args:
+        observation_space: Environment observation space
+        action_space: Environment action space
+        device: JAX device
+        clip_actions: Whether to clip actions to action space bounds
+        clip_log_std: Whether to clip log standard deviation
+        min_log_std: Minimum log standard deviation
+        max_log_std: Maximum log standard deviation
+        reduction: Reduction method for log probability
+        hidden_sizes: Tuple of hidden layer sizes (default: (256, 256))
+    """
+
+    hidden_sizes: Sequence[int] = (256, 256)
+
     def __init__(
         self,
         observation_space,
@@ -15,12 +33,14 @@ class Critic_MLP(GaussianMixin, Model):
         min_log_std=-20,
         max_log_std=2,
         reduction="sum",
+        hidden_sizes: Sequence[int] = (256, 256),
         **kwargs,
     ):
         Model.__init__(self, observation_space, action_space, device, **kwargs)
         GaussianMixin.__init__(
             self, clip_actions, clip_log_std, min_log_std, max_log_std, reduction
         )
+        object.__setattr__(self, "hidden_sizes", tuple(hidden_sizes))
 
     @nn.compact
     def __call__(self, inputs, role):
@@ -40,10 +60,13 @@ class Critic_MLP(GaussianMixin, Model):
             actions = actions.astype(states.dtype)
 
         x = jnp.concatenate([states, actions], axis=-1)
-        x = nn.Dense(256, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(x)
-        x = nn.relu(x)
-        x = nn.Dense(256, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(x)
-        x = nn.relu(x)
+
+        for hidden_size in self.hidden_sizes:
+            x = nn.Dense(
+                hidden_size, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2))
+            )(x)
+            x = nn.relu(x)
+
         q = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(x)
         log_std_parameter = self.param(
             "log_std_parameter", lambda _: jnp.zeros(self.num_actions)
