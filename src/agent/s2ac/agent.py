@@ -1,4 +1,5 @@
 from typing import Union, Tuple, Dict, Any, Optional
+from functools import partial
 
 import copy
 import gymnasium
@@ -20,6 +21,440 @@ from .utils import (
 )
 from .s2ac_cfg import S2AC_DEFAULT_CONFIG
 from .optimizers import AdamW
+
+
+def create_svgd_rollout_fn(
+    policy_apply,
+    critic1_apply,
+    critic2_apply,
+    twin_critics,
+    action_scale,
+    action_bias,
+    num_particles,
+    action_dim,
+    svgd_steps,
+    kernel_sigma_adaptive,
+    stop_grad_svgd_score,
+    kernel_sigma_min,
+    kernel_sigma_max,
+):
+    """
+    Create a JIT-compiled SVGD rollout function.
+    This captures model apply functions in a closure and returns a JIT-compiled function
+    that can be called repeatedly without recompilation.
+    """
+
+    if twin_critics:
+
+        @jax.jit
+        def svgd_rollout_batch(
+            policy_params,
+            critic1_params,
+            critic2_params,
+            states,
+            keys,
+            log_alpha,
+            svgd_step_size,
+            u_clip_bound,
+            kernel_sigma,
+            auto_entropy,
+            alpha_value,
+        ):
+            """Batched SVGD rollout - JIT compiled."""
+
+            def single_rollout(state, key):
+                mean, log_std, _ = policy_apply(
+                    policy_params, {"states": state[None, ...]}, "policy"
+                )
+                mean = mean[0]
+                log_std = log_std[0]
+                std = jnp.exp(log_std)
+
+                key, subkey = random.split(key)
+                noise = random.normal(subkey, shape=(num_particles, action_dim))
+                u0 = mean + std * noise
+
+                use_heuristic = kernel_sigma_adaptive | (kernel_sigma <= 0.0)
+                sigma0 = jax.lax.cond(
+                    use_heuristic,
+                    lambda u: median_heuristic_sigma(
+                        u, kernel_sigma_min, kernel_sigma_max
+                    ),
+                    lambda u: kernel_sigma,
+                    u0,
+                )
+
+                alpha = jax.lax.cond(
+                    auto_entropy, lambda: jnp.exp(log_alpha), lambda: alpha_value
+                )
+
+                def svgd_step(carry, _):
+                    u, sigma = carry
+
+                    def q_grad_single(u_vec):
+                        def q_scalar(uv):
+                            a = action_scale * jnp.tanh(uv) + action_bias
+                            s_b = state[None, :]
+                            a_b = a[None, :]
+                            v1, _, _ = critic1_apply(
+                                critic1_params,
+                                {"states": s_b, "taken_actions": a_b},
+                                "critic_1",
+                            )
+                            v2, _, _ = critic2_apply(
+                                critic2_params,
+                                {"states": s_b, "taken_actions": a_b},
+                                "critic_2",
+                            )
+                            return jnp.minimum(v1.reshape(()), v2.reshape(()))
+
+                        return jax.grad(q_scalar)(u_vec)
+
+                    grad_q = jax.vmap(q_grad_single)(u)
+                    grad_q = jnp.where(jnp.isfinite(grad_q), grad_q, 0.0)
+
+                    grad_q_for_phi = jax.lax.cond(
+                        stop_grad_svgd_score,
+                        lambda g: jax.lax.stop_gradient(g),
+                        lambda g: g,
+                        grad_q,
+                    )
+
+                    phi = svgd_vector_field_s2ac(u, grad_q_for_phi, sigma, alpha)
+                    u_next = u + svgd_step_size * phi
+                    u_next = jnp.clip(u_next, -u_clip_bound, u_clip_bound)
+
+                    sigma_next = jax.lax.cond(
+                        kernel_sigma_adaptive,
+                        lambda un: median_heuristic_sigma(
+                            un, kernel_sigma_min, kernel_sigma_max
+                        ),
+                        lambda un: sigma,
+                        u_next,
+                    )
+
+                    return (u_next, sigma_next), (u, grad_q, sigma)
+
+                # Run SVGD
+                (u_final, _), (u_traj, gradQ_traj, sigmas_traj) = lax.scan(
+                    svgd_step, (u0, sigma0), None, length=svgd_steps
+                )
+
+                final_a = action_scale * jnp.tanh(u_final) + action_bias
+
+                # Compute log probability in u-space (without tanh correction)
+                log_prob = compute_logqL_closed_form(
+                    u0,
+                    u_traj,
+                    gradQ_traj,
+                    mean,
+                    log_std,
+                    svgd_step_size,
+                    sigmas_traj,
+                    alpha,
+                )
+
+                return u_final, final_a, log_prob
+
+            return jax.vmap(single_rollout)(states, keys)
+
+    else:
+
+        @jax.jit
+        def svgd_rollout_batch(
+            policy_params,
+            critic_params,
+            states,
+            keys,
+            log_alpha,
+            svgd_step_size,
+            u_clip_bound,
+            kernel_sigma,
+            auto_entropy,
+            alpha_value,
+        ):
+            """Batched SVGD rollout for single critic - JIT compiled."""
+
+            def single_rollout(state, key):
+                mean, log_std, _ = policy_apply(
+                    policy_params, {"states": state[None, ...]}, "policy"
+                )
+                mean = mean[0]
+                log_std = log_std[0]
+                std = jnp.exp(log_std)
+
+                key, subkey = random.split(key)
+                noise = random.normal(subkey, shape=(num_particles, action_dim))
+                u0 = mean + std * noise
+
+                use_heuristic = kernel_sigma_adaptive | (kernel_sigma <= 0.0)
+                sigma0 = jax.lax.cond(
+                    use_heuristic,
+                    lambda u: median_heuristic_sigma(
+                        u, kernel_sigma_min, kernel_sigma_max
+                    ),
+                    lambda u: kernel_sigma,
+                    u0,
+                )
+
+                alpha = jax.lax.cond(
+                    auto_entropy, lambda: jnp.exp(log_alpha), lambda: alpha_value
+                )
+
+                def svgd_step(carry, _):
+                    u, sigma = carry
+
+                    def q_grad_single(u_vec):
+                        def q_scalar(uv):
+                            a = action_scale * jnp.tanh(uv) + action_bias
+                            s_b = state[None, :]
+                            a_b = a[None, :]
+                            v, _, _ = critic1_apply(
+                                critic_params,
+                                {"states": s_b, "taken_actions": a_b},
+                                "critic",
+                            )
+                            return v.reshape(())
+
+                        return jax.grad(q_scalar)(u_vec)
+
+                    grad_q = jax.vmap(q_grad_single)(u)
+                    grad_q = jnp.where(jnp.isfinite(grad_q), grad_q, 0.0)
+
+                    grad_q_for_phi = jax.lax.cond(
+                        stop_grad_svgd_score,
+                        lambda g: jax.lax.stop_gradient(g),
+                        lambda g: g,
+                        grad_q,
+                    )
+
+                    phi = svgd_vector_field_s2ac(u, grad_q_for_phi, sigma, alpha)
+                    u_next = u + svgd_step_size * phi
+                    u_next = jnp.clip(u_next, -u_clip_bound, u_clip_bound)
+
+                    sigma_next = jax.lax.cond(
+                        kernel_sigma_adaptive,
+                        lambda un: median_heuristic_sigma(
+                            un, kernel_sigma_min, kernel_sigma_max
+                        ),
+                        lambda un: sigma,
+                        u_next,
+                    )
+
+                    return (u_next, sigma_next), (u, grad_q, sigma)
+
+                (u_final, _), (u_traj, gradQ_traj, sigmas_traj) = lax.scan(
+                    svgd_step, (u0, sigma0), None, length=svgd_steps
+                )
+
+                final_a = action_scale * jnp.tanh(u_final) + action_bias
+
+                log_prob = compute_logqL_closed_form(
+                    u0,
+                    u_traj,
+                    gradQ_traj,
+                    mean,
+                    log_std,
+                    svgd_step_size,
+                    sigmas_traj,
+                    alpha,
+                )
+
+                return u_final, final_a, log_prob
+
+            return jax.vmap(single_rollout)(states, keys)
+
+    return svgd_rollout_batch
+
+
+def create_q_grad_fn_twin(critic1_apply, critic2_apply, action_scale, action_bias):
+    """
+    Create a JIT-compiled gradient function for twin critics.
+    This function creates a closure over the critic apply methods once,
+    then can be called repeatedly with different params without recompilation.
+    """
+
+    @jax.jit
+    def q_grad_fn(u_vec, state, critic1_params, critic2_params):
+        """Compute gradient of min(Q1, Q2) w.r.t. u_vec."""
+
+        def q_scalar(u):
+            a = action_scale * jnp.tanh(u) + action_bias
+            s_b = state[None, :]
+            a_b = a[None, :]
+            v1, _, _ = critic1_apply(
+                critic1_params, {"states": s_b, "taken_actions": a_b}, "critic_1"
+            )
+            v2, _, _ = critic2_apply(
+                critic2_params, {"states": s_b, "taken_actions": a_b}, "critic_2"
+            )
+            return jnp.minimum(v1.reshape(()), v2.reshape(()))
+
+        return jax.grad(q_scalar)(u_vec)
+
+    return q_grad_fn
+
+
+def create_q_grad_fn_single(critic_apply, action_scale, action_bias):
+    """
+    Create a JIT-compiled gradient function for single critic.
+    """
+
+    @jax.jit
+    def q_grad_fn(u_vec, state, critic_params):
+        """Compute gradient of Q w.r.t. u_vec."""
+
+        def q_scalar(u):
+            a = action_scale * jnp.tanh(u) + action_bias
+            s_b = state[None, :]
+            a_b = a[None, :]
+            v, _, _ = critic_apply(
+                critic_params, {"states": s_b, "taken_actions": a_b}, "critic"
+            )
+            return v.reshape(())
+
+        return jax.grad(q_scalar)(u_vec)
+
+    return q_grad_fn
+
+
+@partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5))
+def _jit_svgd_rollout_batch(
+    num_particles: int,
+    svgd_steps: int,
+    action_dim: int,
+    kernel_sigma_adaptive: bool,
+    stop_grad_svgd_score: bool,
+    kernel_sigma_min: float,
+    kernel_sigma_max: float,
+    policy_apply_fn,
+    critic1_apply_fn,
+    critic2_apply_fn,
+    policy_params,
+    critic1_params,
+    critic2_params,
+    states,
+    keys,
+    action_scale,
+    action_bias,
+    log_alpha,
+    svgd_step_size,
+    u_clip_bound,
+    kernel_sigma,
+):
+    """
+    Fully JIT-compiled SVGD rollout for a batch of states.
+    All model apply functions are passed as arguments to enable JIT caching.
+    """
+
+    def single_rollout(state, key):
+        # Get policy output
+        mean, log_std, _ = policy_apply_fn(
+            policy_params, {"states": state[None, ...]}, "policy"
+        )
+        mean = mean[0]
+        log_std = log_std[0]
+        std = jnp.exp(log_std)
+
+        # Sample initial particles
+        key, subkey = random.split(key)
+        noise = random.normal(subkey, shape=(num_particles, action_dim))
+        u0 = mean + std * noise
+
+        # Compute initial kernel sigma
+        sigma0 = jax.lax.cond(
+            kernel_sigma_adaptive | (kernel_sigma is None) | (kernel_sigma <= 0),
+            lambda u: median_heuristic_sigma(u, kernel_sigma_min, kernel_sigma_max),
+            lambda u: kernel_sigma if kernel_sigma is not None else 1.0,
+            u0,
+        )
+
+        alpha = jnp.exp(log_alpha)
+
+        # Define Q function for gradients (twin critic min)
+        def q_wrt_u(u_vec, s):
+            a_vec = action_scale * jnp.tanh(u_vec) + action_bias
+            s_b = s[None, :]
+            a_b = a_vec[None, :]
+            v1, _, _ = critic1_apply_fn(
+                critic1_params, {"states": s_b, "taken_actions": a_b}, "critic_1"
+            )
+            v2, _, _ = critic2_apply_fn(
+                critic2_params, {"states": s_b, "taken_actions": a_b}, "critic_2"
+            )
+            return jnp.minimum(v1.reshape(()), v2.reshape(()))
+
+        # SVGD step function
+        def svgd_step(carry, _):
+            u, sigma = carry
+            # Compute gradients for all particles
+            grad_q = jax.vmap(jax.grad(q_wrt_u), in_axes=(0, None))(u, state)
+            grad_q = jnp.where(jnp.isfinite(grad_q), grad_q, 0.0)
+
+            grad_q_for_phi = jax.lax.cond(
+                stop_grad_svgd_score,
+                lambda g: jax.lax.stop_gradient(g),
+                lambda g: g,
+                grad_q,
+            )
+
+            phi = svgd_vector_field_s2ac(u, grad_q_for_phi, sigma, alpha)
+            u_next = u + svgd_step_size * phi
+            u_next = jnp.clip(u_next, -u_clip_bound, u_clip_bound)
+
+            sigma_next = jax.lax.cond(
+                kernel_sigma_adaptive,
+                lambda u: median_heuristic_sigma(u, kernel_sigma_min, kernel_sigma_max),
+                lambda u: sigma,
+                u_next,
+            )
+
+            return (u_next, sigma_next), (u, grad_q, sigma)
+
+        # Run SVGD
+        (u_final, _), (u_traj, gradQ_traj, sigmas_traj) = lax.scan(
+            svgd_step, (u0, sigma0), None, length=svgd_steps
+        )
+
+        # Final action
+        final_a = action_scale * jnp.tanh(u_final) + action_bias
+
+        # Compute log probability in u-space (without tanh correction)
+        log_prob = compute_logqL_closed_form(
+            u0,
+            u_traj,
+            gradQ_traj,
+            mean,
+            log_std,
+            svgd_step_size,
+            sigmas_traj,
+            alpha,
+        )
+
+        return u_final, final_a, log_prob
+
+    return jax.vmap(single_rollout)(states, keys)
+
+
+@jax.jit
+def _jit_select_action_softmax(particles, log_prob, q_vals, alpha, rng_key):
+    """JIT-compiled softmax action selection."""
+    batch = particles.shape[0]
+    logits = q_vals / (alpha + 1e-12)
+    idx = random.categorical(rng_key, logits, axis=1)
+    actions = particles[jnp.arange(batch), idx]
+    selected_log_prob = log_prob[jnp.arange(batch), idx][:, None]
+    return actions, selected_log_prob
+
+
+@jax.jit
+def _jit_select_action_max(particles, log_prob, q_vals):
+    """JIT-compiled max Q action selection."""
+    batch = particles.shape[0]
+    idx = jnp.argmax(q_vals, axis=1)
+    actions = particles[jnp.arange(batch), idx]
+    selected_log_prob = log_prob[jnp.arange(batch), idx][:, None]
+    return actions, selected_log_prob
 
 
 class S2AC(Agent):
@@ -50,6 +485,7 @@ class S2AC(Agent):
         self._svgd_step_size = self.cfg.get("svgd_step_size")
         self._kernel_sigma = self.cfg.get("kernel_sigma")
         self._kernel_sigma_adaptive = self.cfg.get("kernel_sigma_adaptive")
+        self._kernel_sigma_min = self.cfg.get("kernel_sigma_min", 0.01)
         self._kernel_sigma_max = self.cfg.get("kernel_sigma_max", 10.0)
         self._stop_grad_svgd_score = self.cfg.get("stop_grad_svgd_score")
         self._max_phi_norm = self.cfg.get("max_phi_norm", 10.0)
@@ -79,6 +515,7 @@ class S2AC(Agent):
         self._random_timesteps = self.cfg.get("random_timesteps")
         self._learning_starts = self.cfg.get("learning_starts")
         self._grad_norm_clip = self.cfg.get("grad_norm_clip")
+        self._gradient_steps = self.cfg.get("gradient_steps", 1)
 
         twin_cfg = bool(self.cfg.get("twin_critics"))
         has_critic2 = self.models.get("critic_2", None) is not None
@@ -272,6 +709,52 @@ class S2AC(Agent):
             )
             self.alpha_opt_state = self.alpha_optimizer.init(self._log_alpha)
 
+        if self._twin_critics:
+            self._q_grad_fn = create_q_grad_fn_twin(
+                self.critic_models[0].apply,
+                self.critic_models[1].apply,
+                self._action_scale,
+                self._action_bias,
+            )
+            # Create JIT-compiled SVGD rollout function
+            self._jit_svgd_rollout = create_svgd_rollout_fn(
+                self.policy.apply,
+                self.critic_models[0].apply,
+                self.critic_models[1].apply,
+                True,  # twin_critics
+                self._action_scale,
+                self._action_bias,
+                self._num_particles,
+                self._action_dim,
+                self._svgd_steps,
+                self._kernel_sigma_adaptive,
+                self._stop_grad_svgd_score,
+                self._kernel_sigma_min,
+                self._kernel_sigma_max,
+            )
+        else:
+            self._q_grad_fn = create_q_grad_fn_single(
+                self.critic_models[0].apply,
+                self._action_scale,
+                self._action_bias,
+            )
+            # Create JIT-compiled SVGD rollout function
+            self._jit_svgd_rollout = create_svgd_rollout_fn(
+                self.policy.apply,
+                self.critic_models[0].apply,
+                None,  # no second critic
+                False,  # single critic
+                self._action_scale,
+                self._action_bias,
+                self._num_particles,
+                self._action_dim,
+                self._svgd_steps,
+                self._kernel_sigma_adaptive,
+                self._stop_grad_svgd_score,
+                self._kernel_sigma_min,
+                self._kernel_sigma_max,
+            )
+
         self._setup_loss_functions()
 
         def _alpha_loss_fn(log_alpha, log_prob_mean):
@@ -279,6 +762,58 @@ class S2AC(Agent):
             return -alpha * (log_prob_mean + self._target_entropy)
 
         self._alpha_value_and_grad = jax.jit(jax.value_and_grad(_alpha_loss_fn))
+
+    def _setup_jit_functions(self):
+        """Setup JIT-compiled functions for fast inference and training."""
+
+        self._jit_svgd_rollout = partial(
+            _jit_svgd_rollout_batch,
+            self._num_particles,
+            self._svgd_steps,
+            self._action_dim,
+            self._kernel_sigma_adaptive,
+            self._stop_grad_svgd_score,
+            self._kernel_sigma_min,
+            self._kernel_sigma_max,
+        )
+
+        # JIT compile critic evaluation for action selection
+        @jax.jit
+        def _eval_q_particles(critic1_params, critic2_params, states, particles):
+            return self._critic_values_particles_fast(
+                critic1_params, critic2_params, states, particles
+            )
+
+        self._jit_eval_q_particles = _eval_q_particles
+
+    def _critic_values_particles_fast(
+        self, critic1_params, critic2_params, states, particles
+    ):
+        """Fast batched Q evaluation for particles."""
+        batch_size = states.shape[0]
+        num_particles = particles.shape[1]
+        state_dim = states.shape[1]
+
+        states_expanded = jnp.broadcast_to(
+            states[:, None, :], (batch_size, num_particles, state_dim)
+        )
+        states_flat = states_expanded.reshape(-1, state_dim)
+        particles_flat = particles.reshape(-1, particles.shape[-1])
+
+        q1, _, _ = self.critic_models[0].apply(
+            critic1_params,
+            {"states": states_flat, "taken_actions": particles_flat},
+            "critic_1",
+        )
+        q2, _, _ = self.critic_models[1].apply(
+            critic2_params,
+            {"states": states_flat, "taken_actions": particles_flat},
+            "critic_2",
+        )
+
+        q1 = q1.reshape(batch_size, num_particles)
+        q2 = q2.reshape(batch_size, num_particles)
+        return jnp.minimum(q1, q2)
 
     def _setup_loss_functions(self):
         # Critic loss function
@@ -320,32 +855,42 @@ class S2AC(Agent):
 
         # Actor loss function
         if self._twin_critics:
+            jit_svgd = self._jit_svgd_rollout
+            q_grad_fn = self._q_grad_fn
+            # Sanitize kernel_sigma for JAX tracing
+            _kernel_sigma = (
+                self._kernel_sigma if self._kernel_sigma is not None else -1.0
+            )
+            _kernel_sigma_min = self._kernel_sigma_min  # Capture for closure
 
             def _actor_loss_fn_twin(
                 policy_params, critic1_params, critic2_params, states, keys, log_alpha
             ):
                 alpha = jnp.exp(log_alpha)
 
-                # SVGD Rollout -> get both u (unbounded) and scaled actions
-                particles_u, particles_a, _ = self._svgd_rollout_batch(
+                particles_u, particles_a, log_prob = jit_svgd(
                     policy_params,
-                    (self.critic_models[0], self.critic_models[1]),
-                    (critic1_params, critic2_params),
+                    critic1_params,
+                    critic2_params,
                     states,
                     keys,
+                    log_alpha,
+                    self._svgd_step_size,
+                    self._u_clip_bound,
+                    _kernel_sigma,
+                    self._auto_entropy_tuning,
+                    self._alpha,
                 )
                 particles_a = jax.lax.stop_gradient(particles_a)
+                # log_prob shape: (batch, num_particles)
 
-                # Compute GRAD Q in u-space (attraction)
-                # get scalar Q(u, s) callable for grads
-                q_min_wrt_u = self._make_q_wrt_u_scalar(
-                    (self.critic_models[0], self.critic_models[1]),
-                    (critic1_params, critic2_params),
-                )
-
+                # Compute GRAD Q in u-space using cached gradient function
                 # vmap over batch and particles to compute grad dQ/du
                 grad_q = jax.vmap(
-                    jax.vmap(jax.grad(q_min_wrt_u), in_axes=(0, None)),
+                    jax.vmap(
+                        lambda u, s: q_grad_fn(u, s, critic1_params, critic2_params),
+                        in_axes=(0, None),
+                    ),
                     in_axes=(0, 0),
                 )(particles_u, states)
 
@@ -356,7 +901,7 @@ class S2AC(Agent):
                         if self._kernel_sigma_adaptive
                         else self._kernel_sigma
                     )
-                    sigma = jnp.maximum(sigma, 0.1)
+                    sigma = jnp.maximum(sigma, _kernel_sigma_min)
                     if self._stop_grad_svgd_score:
                         g_batch_u = jax.lax.stop_gradient(g_batch_u)
                     return svgd_vector_field_s2ac(p_batch_u, g_batch_u, sigma, alpha)
@@ -366,18 +911,31 @@ class S2AC(Agent):
 
                 # Surrogate Loss: re-evaluate rollout (differentiable) to produce u outputs
                 # Here we use u (the first returned element) so autodiff flows through u -> policy_params
-                particles_u_for_grad, _, _ = self._svgd_rollout_batch(
+                particles_u_for_grad, _, _ = jit_svgd(
                     policy_params,
-                    (self.critic_models[0], self.critic_models[1]),
-                    (critic1_params, critic2_params),
+                    critic1_params,
+                    critic2_params,
                     states,
                     keys,
+                    log_alpha,
+                    self._svgd_step_size,
+                    self._u_clip_bound,
+                    _kernel_sigma,
+                    self._auto_entropy_tuning,
+                    self._alpha,
                 )
                 surrogate_loss = -jnp.mean(
                     jnp.sum(particles_u_for_grad * stein_forces_sg, axis=-1)
                 )
 
-                # Metrics
+                # Entropy regularization: encourage policy to maintain diversity
+                # log_prob is negative (valid probability), so minimizing alpha * log_prob
+                # encourages higher entropy (more negative log_prob = lower probability = higher entropy)
+                entropy_loss = alpha * jnp.mean(log_prob)
+
+                # Total actor loss = surrogate (Stein matching) + entropy regularization
+                actor_loss = surrogate_loss + entropy_loss
+
                 q1 = self._critic_values_particles(
                     self.critic_models[0], critic1_params, states, particles_a
                 )
@@ -386,10 +944,22 @@ class S2AC(Agent):
                 )
                 q_values = jnp.minimum(q1, q2)
 
+                actual_log_prob_mean = jnp.mean(log_prob)
+                actual_log_prob_std = jnp.std(log_prob)
+
+                # Entropy is -log_prob
+                actual_entropy = -log_prob
+                entropy_mean = jnp.mean(actual_entropy)
+                entropy_std = jnp.std(actual_entropy)
+
+                # Compute particle std for monitoring diversity
                 particle_std = jnp.mean(jnp.std(particles_a, axis=1), axis=-1)
-                entropy_est = 0.5 * self._action_dim * (
-                    1.0 + jnp.log(2 * jnp.pi)
-                ) + jnp.log(particle_std + 1e-8)
+
+                # Compute policy network's std output (initial particle spread before SVGD)
+                _, policy_log_std, _ = self.policy.apply(
+                    policy_params, {"states": states}, "policy"
+                )
+                policy_std_mean = jnp.mean(jnp.exp(policy_log_std))
 
                 # Additional metrics
                 stein_force_norm = jnp.mean(jnp.linalg.norm(stein_forces_sg, axis=-1))
@@ -404,40 +974,58 @@ class S2AC(Agent):
                 metrics = {
                     "q_mean": jnp.mean(q_values),
                     "q_std": jnp.std(q_values),
-                    "entropy_mean": jnp.mean(entropy_est),
-                    "entropy_std": jnp.std(entropy_est),
-                    "log_prob_mean": -jnp.mean(entropy_est),
-                    "log_prob_std": jnp.std(entropy_est),
+                    "entropy_mean": entropy_mean,
+                    "entropy_std": entropy_std,
+                    "log_prob_mean": actual_log_prob_mean,
+                    "log_prob_std": actual_log_prob_std,
                     "alpha": alpha,
                     "particle_std": jnp.mean(particle_std),
+                    "policy_std": policy_std_mean,
                     "stein_force_norm": stein_force_norm,
                     "grad_q_norm": grad_q_norm,
                     "kernel_sigma_mean": mean_sigma,
                     "entropy_floor_penalty": 0.0,
+                    "surrogate_loss": surrogate_loss,
+                    "entropy_loss": entropy_loss,
                 }
-                return surrogate_loss, metrics
+                return actor_loss, metrics
 
             self._actor_value_and_grad = jax.jit(
                 jax.value_and_grad(_actor_loss_fn_twin, argnums=0, has_aux=True)
             )
         else:
             # Single critic version
+            jit_svgd = self._jit_svgd_rollout
+            q_grad_fn = self._q_grad_fn
+            _kernel_sigma = (
+                self._kernel_sigma if self._kernel_sigma is not None else -1.0
+            )
+            _kernel_sigma_min = self._kernel_sigma_min  # Capture for closure
+
             def _actor_loss_fn_single(
                 policy_params, critic_params, states, keys, log_alpha
             ):
                 alpha = jnp.exp(log_alpha)
 
-                particles_u, particles_a, _ = self._svgd_rollout_batch(
-                    policy_params, self.critic_models[0], critic_params, states, keys
+                particles_u, particles_a, log_prob = jit_svgd(
+                    policy_params,
+                    critic_params,
+                    states,
+                    keys,
+                    log_alpha,
+                    self._svgd_step_size,
+                    self._u_clip_bound,
+                    _kernel_sigma,
+                    self._auto_entropy_tuning,
+                    self._alpha,
                 )
                 particles_a = jax.lax.stop_gradient(particles_a)
-
-                q_wrt_u_scalar = self._make_q_wrt_u_scalar(
-                    self.critic_models[0], critic_params
-                )
+                # log_prob shape: (batch, num_particles)
 
                 grad_q = jax.vmap(
-                    jax.vmap(jax.grad(q_wrt_u_scalar), in_axes=(0, None)),
+                    jax.vmap(
+                        lambda u, s: q_grad_fn(u, s, critic_params), in_axes=(0, None)
+                    ),
                     in_axes=(0, 0),
                 )(particles_u, states)
 
@@ -446,9 +1034,9 @@ class S2AC(Agent):
                     sigma = (
                         self._mean_heuristic_sigma(p_batch_u)
                         if self._kernel_sigma_adaptive
-                        else self._kernel_sigma
+                        else _kernel_sigma
                     )
-                    sigma = jnp.maximum(sigma, 0.1)
+                    sigma = jnp.maximum(sigma, _kernel_sigma_min)
 
                     if self._stop_grad_svgd_score:
                         g_batch_u = jax.lax.stop_gradient(g_batch_u)
@@ -458,20 +1046,52 @@ class S2AC(Agent):
                 stein_forces = jax.vmap(compute_batch_force_u)(particles_u, grad_q)
                 stein_forces_sg = jax.lax.stop_gradient(stein_forces)
 
-                particles_u_for_grad, _, _ = self._svgd_rollout_batch(
-                    policy_params, self.critic_models[0], critic_params, states, keys
+                particles_u_for_grad, _, _ = jit_svgd(
+                    policy_params,
+                    critic_params,
+                    states,
+                    keys,
+                    log_alpha,
+                    self._svgd_step_size,
+                    self._u_clip_bound,
+                    _kernel_sigma,
+                    self._auto_entropy_tuning,
+                    self._alpha,
                 )
                 surrogate_loss = -jnp.mean(
                     jnp.sum(particles_u_for_grad * stein_forces_sg, axis=-1)
                 )
 
+                # Entropy regularization: encourage policy to maintain diversity
+                # log_prob is negative (valid probability), so minimizing alpha * log_prob
+                # encourages higher entropy (more negative log_prob = lower probability = higher entropy)
+                entropy_loss = alpha * jnp.mean(log_prob)
+
+                # Total actor loss = surrogate (Stein matching) + entropy regularization
+                actor_loss = surrogate_loss + entropy_loss
+
                 q_values = self._critic_values_particles(
                     self.critic_models[0], critic_params, states, particles_a
                 )
+
+                # Actual log probability from closed-form computation (with tanh correction)
+                actual_log_prob_mean = jnp.mean(log_prob)
+                actual_log_prob_std = jnp.std(log_prob)
+
+                # Entropy is -log_prob
+                actual_entropy = -log_prob
+                entropy_mean = jnp.mean(actual_entropy)
+                entropy_std = jnp.std(actual_entropy)
+
+                # Also compute particle std for monitoring diversity
                 particle_std = jnp.mean(jnp.std(particles_a, axis=1), axis=-1)
-                entropy_est = 0.5 * self._action_dim * (
-                    1.0 + jnp.log(2 * jnp.pi)
-                ) + jnp.log(particle_std + 1e-8)
+
+                # Compute policy network's std output (initial particle spread before SVGD)
+                # This helps monitor if the policy network itself is collapsing
+                _, policy_log_std, _ = self.policy.apply(
+                    policy_params, {"states": states}, "policy"
+                )
+                policy_std_mean = jnp.mean(jnp.exp(policy_log_std))
 
                 # Additional metrics
                 stein_force_norm = jnp.mean(jnp.linalg.norm(stein_forces_sg, axis=-1))
@@ -486,18 +1106,21 @@ class S2AC(Agent):
                 metrics = {
                     "q_mean": jnp.mean(q_values),
                     "q_std": jnp.std(q_values),
-                    "entropy_mean": jnp.mean(entropy_est),
-                    "entropy_std": jnp.std(entropy_est),
-                    "log_prob_mean": -jnp.mean(entropy_est),
-                    "log_prob_std": jnp.std(entropy_est),
+                    "entropy_mean": entropy_mean,
+                    "entropy_std": entropy_std,
+                    "log_prob_mean": actual_log_prob_mean,
+                    "log_prob_std": actual_log_prob_std,
                     "alpha": alpha,
                     "particle_std": jnp.mean(particle_std),
+                    "policy_std": policy_std_mean,
                     "stein_force_norm": stein_force_norm,
                     "grad_q_norm": grad_q_norm,
                     "kernel_sigma_mean": mean_sigma,
                     "entropy_floor_penalty": 0.0,
+                    "surrogate_loss": surrogate_loss,
+                    "entropy_loss": entropy_loss,
                 }
-                return surrogate_loss, metrics
+                return actor_loss, metrics
 
             self._actor_value_and_grad = jax.jit(
                 jax.value_and_grad(_actor_loss_fn_single, argnums=0, has_aux=True)
@@ -555,7 +1178,15 @@ class S2AC(Agent):
         return q_wrt_u
 
     def act(self, states: jax.Array, timestep: int, timesteps: int) -> jax.Array:
+        """Select action based on current policy using SVGD particle optimization.
+
+        During random_timesteps, actions are sampled uniformly.
+        After that, SVGD rollout generates particles and action is selected
+        via softmax (training) or max Q-value (evaluation).
+        """
         states = jnp.atleast_2d(states)
+
+        # Random exploration during initial timesteps
         if timestep < self._random_timesteps:
             self._rng_key, subkey = random.split(self._rng_key)
             actions = random.uniform(
@@ -566,28 +1197,96 @@ class S2AC(Agent):
             )
             return self._action_scale * actions + self._action_bias, None, {}
 
+        # Get model parameters
         policy_params = self.policy.state_dict.params
-        if self._twin_critics:
-            critic_params = (
-                self.critic_models[0].state_dict.params,
-                self.critic_models[1].state_dict.params,
-            )
-            critic_model = (self.critic_models[0], self.critic_models[1])
-        else:
-            critic_params = self.critic_models[0].state_dict.params
-            critic_model = self.critic_models[0]
 
+        # Generate random keys for SVGD
         self._rng_key, subkey = random.split(self._rng_key)
         keys = random.split(subkey, states.shape[0])
 
-        _, particles, log_prob = self._svgd_rollout_batch(
-            policy_params, critic_model, critic_params, states, keys
-        )
+        # kernel_sigma: use -1.0 to indicate "use heuristic" for JAX tracing
+        kernel_sigma = self._kernel_sigma if self._kernel_sigma is not None else -1.0
+
+        # Use JIT-compiled SVGD rollout
+        if self._twin_critics:
+            critic1_params = self.critic_models[0].state_dict.params
+            critic2_params = self.critic_models[1].state_dict.params
+            _, particles, log_prob = self._jit_svgd_rollout(
+                policy_params,
+                critic1_params,
+                critic2_params,
+                states,
+                keys,
+                self._log_alpha,
+                self._svgd_step_size,
+                self._u_clip_bound,
+                kernel_sigma,
+                self._auto_entropy_tuning,
+                self._alpha,
+            )
+        else:
+            critic_params = self.critic_models[0].state_dict.params
+            _, particles, log_prob = self._jit_svgd_rollout(
+                policy_params,
+                critic_params,
+                states,
+                keys,
+                self._log_alpha,
+                self._svgd_step_size,
+                self._u_clip_bound,
+                kernel_sigma,
+                self._auto_entropy_tuning,
+                self._alpha,
+            )
+
         mode = "softmax" if self.training else "max"
         actions, selected_log_prob = self._select_action_from_particles(
             mode, states, particles, log_prob
         )
         return actions, selected_log_prob, {}
+
+    def _select_action_from_particles_fast(
+        self,
+        mode: str,
+        states: jax.Array,
+        particles: jax.Array,
+        log_prob: jax.Array,
+        critic1_params,
+        critic2_params,
+    ):
+        """Fast action selection using JIT-compiled functions."""
+        batch, m, _ = particles.shape
+        mode = (mode or "random").lower()
+
+        if mode == "mean":
+            return jnp.mean(particles, axis=1), jnp.mean(
+                log_prob, axis=1, keepdims=True
+            )
+
+        if mode == "random":
+            self._rng_key, subkey = random.split(self._rng_key)
+            idx = random.randint(subkey, (batch,), minval=0, maxval=m)
+            actions = particles[jnp.arange(batch), idx]
+            selected_log_prob = log_prob[jnp.arange(batch), idx][:, None]
+            return actions, selected_log_prob
+
+        q_vals = self._jit_eval_q_particles(
+            critic1_params, critic2_params, states, particles
+        )
+
+        if mode == "max":
+            return _jit_select_action_max(particles, log_prob, q_vals)
+
+        if mode == "softmax":
+            alpha = (
+                jnp.exp(self._log_alpha) if self._auto_entropy_tuning else self._alpha
+            )
+            self._rng_key, subkey = random.split(self._rng_key)
+            return _jit_select_action_softmax(
+                particles, log_prob, q_vals, alpha, subkey
+            )
+
+        return jnp.mean(particles, axis=1), jnp.mean(log_prob, axis=1, keepdims=True)
 
     def record_transition(
         self,
@@ -695,6 +1394,12 @@ class S2AC(Agent):
         if self.memory is None or len(self.memory) < self._batch_size:
             return
 
+        # Perform multiple gradient steps per update call
+        for _ in range(self._gradient_steps):
+            self._gradient_step(timestep, timesteps)
+
+    def _gradient_step(self, timestep: int, timesteps: int) -> None:
+        """Perform a single gradient step for critic and actor updates."""
         self._update_counter += 1
 
         (
@@ -735,21 +1440,35 @@ class S2AC(Agent):
         self._rng_key, subkey = random.split(self._rng_key)
         next_keys = random.split(subkey, sampled_next_states.shape[0])
 
+        # Sanitize kernel_sigma for JAX tracing
+        kernel_sigma = self._kernel_sigma if self._kernel_sigma is not None else -1.0
+
         if self._twin_critics:
-            _, next_particles, next_log_prob = self._svgd_rollout_batch(
+            _, next_particles, next_log_prob = self._jit_svgd_rollout(
                 policy_params,
-                (self.critic_models[0], self.critic_models[1]),
-                (critic_params1, critic_params2),
+                critic_params1,
+                critic_params2,
                 sampled_next_states,
                 next_keys,
+                self._log_alpha,
+                self._svgd_step_size,
+                self._u_clip_bound,
+                kernel_sigma,
+                self._auto_entropy_tuning,
+                self._alpha,
             )
         else:
-            _, next_particles, next_log_prob = self._svgd_rollout_batch(
+            _, next_particles, next_log_prob = self._jit_svgd_rollout(
                 policy_params,
-                self.critic_models[0],
                 critic_params,
                 sampled_next_states,
                 next_keys,
+                self._log_alpha,
+                self._svgd_step_size,
+                self._u_clip_bound,
+                kernel_sigma,
+                self._auto_entropy_tuning,
+                self._alpha,
             )
         next_particles = jax.lax.stop_gradient(next_particles)
         next_log_prob = jax.lax.stop_gradient(next_log_prob)
@@ -1017,17 +1736,14 @@ class S2AC(Agent):
         """
 
         def single(state, key):
-            return self._svgd_rollout_single(
-                policy_params, critic_model, critic_params, state, key
-            )
+            return self._svgd_rollout_single(policy_params, critic_params, state, key)
 
         return jax.vmap(single)(states, keys)
 
-    def _svgd_rollout_single(
-        self, policy_params, critic_model, critic_params, state, key
-    ):
+    def _svgd_rollout_single(self, policy_params, critic_params, state, key):
         """
         Perform SVGD rollout for a single state (vmapped over batch in _svgd_rollout_batch).
+        Uses the cached Q-gradient function for efficient JIT compilation.
         Returns: (final_u, final_a, log_prob)
         """
         mean, log_std, _ = self.policy.apply(
@@ -1040,8 +1756,6 @@ class S2AC(Agent):
         key, subkey = random.split(key)
         noise = random.normal(subkey, shape=(self._particles, self._action_dim))
         u0 = mean + std * noise  # (P, A)
-
-        q_wrt_u_scalar = self._make_q_wrt_u_scalar(critic_model, critic_params)
 
         # initial kernel sigma
         if (
@@ -1059,28 +1773,63 @@ class S2AC(Agent):
 
         u_clip_bound = self._u_clip_bound
 
-        # step function for lax.scan: carry = (u, sigma), out = (u_pre, grad_q_pre, sigma_pre)
-        def svgd_step(carry, _):
-            u, sigma = carry  # u: (P, A)
-            # compute grad_q (P, A)
-            grad_q = jax.vmap(jax.grad(q_wrt_u_scalar), in_axes=(0, None))(u, state)
+        # Get the cached gradient function
+        q_grad_fn = self._q_grad_fn
 
-            grad_q = jnp.where(jnp.isfinite(grad_q), grad_q, 0.0)
-            # optionally stop grad on score
-            grad_q_for_phi = (
-                jax.lax.stop_gradient(grad_q) if self._stop_grad_svgd_score else grad_q
-            )
-            phi = svgd_vector_field_s2ac(u, grad_q_for_phi, sigma, alpha)
-            u_next = u + eps * phi
-            # Clip particles to prevent explosion
-            u_next = jnp.clip(u_next, -u_clip_bound, u_clip_bound)
-            sigma_next = (
-                self._mean_heuristic_sigma(u_next)
-                if self._kernel_sigma_adaptive
-                else sigma
-            )
-            out = (u, grad_q, sigma)  # store pre-update u, grad, sigma
-            return (u_next, sigma_next), out
+        if self._twin_critics:
+            critic1_params, critic2_params = critic_params
+
+            # step function for lax.scan using cached gradient function
+            def svgd_step(carry, _):
+                u, sigma = carry  # u: (P, A)
+                # compute grad_q (P, A) using cached JIT function
+                grad_q = jax.vmap(
+                    lambda u_vec: q_grad_fn(
+                        u_vec, state, critic1_params, critic2_params
+                    )
+                )(u)
+
+                grad_q = jnp.where(jnp.isfinite(grad_q), grad_q, 0.0)
+                grad_q_for_phi = (
+                    jax.lax.stop_gradient(grad_q)
+                    if self._stop_grad_svgd_score
+                    else grad_q
+                )
+                phi = svgd_vector_field_s2ac(u, grad_q_for_phi, sigma, alpha)
+                u_next = u + eps * phi
+                u_next = jnp.clip(u_next, -u_clip_bound, u_clip_bound)
+                sigma_next = (
+                    self._mean_heuristic_sigma(u_next)
+                    if self._kernel_sigma_adaptive
+                    else sigma
+                )
+                out = (u, grad_q, sigma)
+                return (u_next, sigma_next), out
+
+        else:
+            # single critic
+            def svgd_step(carry, _):
+                u, sigma = carry  # u: (P, A)
+                grad_q = jax.vmap(lambda u_vec: q_grad_fn(u_vec, state, critic_params))(
+                    u
+                )
+
+                grad_q = jnp.where(jnp.isfinite(grad_q), grad_q, 0.0)
+                grad_q_for_phi = (
+                    jax.lax.stop_gradient(grad_q)
+                    if self._stop_grad_svgd_score
+                    else grad_q
+                )
+                phi = svgd_vector_field_s2ac(u, grad_q_for_phi, sigma, alpha)
+                u_next = u + eps * phi
+                u_next = jnp.clip(u_next, -u_clip_bound, u_clip_bound)
+                sigma_next = (
+                    self._mean_heuristic_sigma(u_next)
+                    if self._kernel_sigma_adaptive
+                    else sigma
+                )
+                out = (u, grad_q, sigma)
+                return (u_next, sigma_next), out
 
         # run scan
         (u_final, _), scan_outs = lax.scan(svgd_step, (u0, sigma0), None, length=T)
@@ -1091,16 +1840,17 @@ class S2AC(Agent):
         # final scaled action
         final_a = self._action_scale * jnp.tanh(u_final) + self._action_bias
 
-        # compute closed-form log q_L based on u-trajectory; a0 = initial u
+        # compute closed-form log q_L in u-space (without tanh correction)
+        # Alpha tuning expects u-space log_prob to be negative
         log_prob = compute_logqL_closed_form(
-            a0=u0,  # initial u
-            all_a_list=u_traj,  # (T, P, A)
-            all_gradQ_list=gradQ_traj,  # (T, P, A)
-            mu0=mean,
-            logstd0=log_std,
-            eps=eps,
-            sigma_list=sigmas_traj,
-            alpha=alpha,
+            u0,  # initial u
+            u_traj,  # (T, P, A)
+            gradQ_traj,  # (T, P, A)
+            mean,
+            log_std,
+            eps,
+            sigmas_traj,
+            alpha,
         )
 
         return u_final, final_a, log_prob
@@ -1111,8 +1861,10 @@ class S2AC(Agent):
         return jnp.minimum(q1, q2)
 
     def _mean_heuristic_sigma(
-        self, actions: jnp.ndarray, h_min: float = 1e-3
+        self, actions: jnp.ndarray, h_min: float = None
     ) -> jnp.ndarray:
+        if h_min is None:
+            h_min = self._kernel_sigma_min
         return median_heuristic_sigma(actions, h_min, self._kernel_sigma_max)
 
     def _select_action_from_particles(

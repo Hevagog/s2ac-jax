@@ -153,11 +153,20 @@ def action_score_from_Q(
 
 
 def _logqL_step(a_curr, gradQ_curr, sigma_kernel, eps, alpha_internal=1.0):
+    """
+    Compute the incremental log q change for one SVGD step.
+    Based on Theorem 3.3 from the S2AC paper.
+
+    Formula: Δlog q_i = -(ε/mσ²) * Σ_{j≠i} K(a_j,a_i) * [(a_i-a_j)^T ∇Q_j + (α/σ²)||a_i-a_j||² - dα]
+
+    Note: The SVGD updates DECREASE entropy (increase log_prob), so this term is SUBTRACTED
+    from log q_0 in the accumulation.
+    """
     m, d = a_curr.shape
     sigma_sq = sigma_kernel * sigma_kernel
     inv_sigma_sq = 1.0 / (sigma_sq + 1e-6)
 
-    # Pairwise squared dists
+    # Pairwise squared dists: ||a_i - a_j||^2
     a_sq = jnp.sum(a_curr * a_curr, axis=1)
     dist_sq = jnp.maximum(
         a_sq[:, None] + a_sq[None, :] - 2.0 * (a_curr @ a_curr.T), 0.0
@@ -166,19 +175,25 @@ def _logqL_step(a_curr, gradQ_curr, sigma_kernel, eps, alpha_internal=1.0):
     K = jnp.exp(-dist_sq * (0.5 * inv_sigma_sq))
 
     # dot_terms_ij = (a_i - a_j)^T * gradQ_j
-    term_a = a_curr @ gradQ_curr.T
-    term_b_vec = jnp.sum(a_curr * gradQ_curr, axis=1)
-    dot_terms = term_a - term_b_vec[None, :]
+    # = a_i^T gradQ_j - a_j^T gradQ_j
+    term_a = a_curr @ gradQ_curr.T  # (m, m): term_a[i,j] = a_i^T gradQ_j
+    term_b_vec = jnp.sum(a_curr * gradQ_curr, axis=1)  # (m,): term_b[j] = a_j^T gradQ_j
+    dot_terms = (
+        term_a - term_b_vec[None, :]
+    )  # (m, m): dot_terms[i,j] = (a_i - a_j)^T gradQ_j
 
     mask = 1.0 - jnp.eye(m)
 
+    # M[i,j] = K(a_j, a_i) * [(a_i-a_j)^T ∇Q_j + (α/σ²)||a_i-a_j||² - dα]
+    # Note: K is symmetric, so K[i,j] = K[j,i]
     M = K * (
         dot_terms + (alpha_internal * inv_sigma_sq) * dist_sq - (d * alpha_internal)
     )
     M = M * mask
 
-    per_i_sum = -1.0 * jnp.sum(M, axis=1)
-    coeff = eps / ((m + 1e-6) * (sigma_sq + 1e-6))
+    # Sum over j for each i: this gives the change in log q_i
+    per_i_sum = jnp.sum(M, axis=1)  # Sum over j (columns)
+    coeff = -eps / ((m + 1e-6) * (sigma_sq + 1e-6))
     return coeff * per_i_sum
 
 
@@ -231,10 +246,75 @@ def compute_logqL_closed_form(
         return _logqL_step(a_step, gq_step, sigma_step, eps, alpha_internal=alpha)
 
     per_step = vmap(step_fn, in_axes=(0, 0, 0))(traj_a, traj_gradQ, sigma_arr)  # (T, m)
+
+    per_step = jnp.clip(per_step, -10.0, 10.0)
+
     accum = jnp.sum(per_step, axis=0)  # (m,)
 
     logqL = logq0 + accum
+    # Upper bound of 0.0 ensures valid probability; -20.0 lower bound prevents -inf
+    logqL = jnp.clip(logqL, -20.0, 0.0)
+
     return logqL
+
+
+@jit
+def compute_tanh_jacobian_correction(u: jnp.ndarray) -> jnp.ndarray:
+    """
+    Compute the log determinant of the Jacobian for tanh squashing.
+
+    When transforming from u-space to a-space via a = tanh(u),
+    we need to correct the log probability:
+
+    log p(a) = log p(u) - Σ_d log |da_d/du_d|
+             = log p(u) - Σ_d log(1 - tanh²(u_d))
+
+    Using the numerically stable form:
+    log(1 - tanh²(u)) = log(sech²(u)) = 2 * log(sech(u))
+                      = 2 * (log(2) - u - softplus(-2u))
+
+    Args:
+        u: (m, d) or (d,) array of unbounded actions
+
+    Returns:
+        correction: (m,) or () array of log-det-jacobian corrections (to subtract)
+    """
+    log_1_minus_tanh_sq = 2.0 * (jnp.log(2.0) - u - jax.nn.softplus(-2.0 * u))
+    # Sum over action dimensions
+    return jnp.sum(log_1_minus_tanh_sq, axis=-1)
+
+
+@jit
+def compute_logqL_closed_form_with_tanh(
+    u0, u_final, all_u_list, all_gradQ_list, mu0, logstd0, eps, sigma_list, alpha
+):
+    """
+    Compute approximated log q_L for final particles WITH tanh Jacobian correction.
+
+    This is the correct log probability in action space (a = tanh(u)).
+
+    - u0: (m,d) initial u particles
+    - u_final: (m,d) final u particles (before tanh)
+    - all_u_list: list or stack of length T, each (m,d) (u at each SVGD step)
+    - all_gradQ_list: list or stack (T, m, d)
+    - mu0, logstd0: (d,) or (1,d) initial gaussian params
+    - eps: scalar step size
+    - sigma_list: (T,) array of kernel sigmas used at each step, or scalar
+    - alpha: scalar temperature
+
+    Returns logqL: (m,) per-particle log-likelihood estimate in ACTION SPACE.
+    """
+    # Get log q in u-space (without tanh correction)
+    logq_u = compute_logqL_closed_form(
+        u0, all_u_list, all_gradQ_list, mu0, logstd0, eps, sigma_list, alpha
+    )
+
+    # Apply tanh Jacobian correction for final particles
+    # log p(a) = log p(u) - log |det(da/du)| = log p(u) - Σ log(1 - tanh²(u))
+    tanh_correction = compute_tanh_jacobian_correction(u_final)
+
+    logq_a = logq_u - tanh_correction
+    return logq_a
 
 
 @jit
