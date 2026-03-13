@@ -15,7 +15,7 @@ from skrl.models.jax import Model
 
 from skrl.agents.jax import Agent
 from .utils import (
-    compute_logqL_closed_form,
+    compute_logqL_closed_form_with_tanh,
     svgd_vector_field_s2ac,
     median_heuristic_sigma,
 )
@@ -142,9 +142,10 @@ def create_svgd_rollout_fn(
 
                 final_a = action_scale * jnp.tanh(u_final) + action_bias
 
-                # Compute log probability in u-space (without tanh correction)
-                log_prob = compute_logqL_closed_form(
+                # Compute log probability in ACTION space (with tanh correction)
+                log_prob = compute_logqL_closed_form_with_tanh(
                     u0,
+                    u_final,
                     u_traj,
                     gradQ_traj,
                     mean,
@@ -249,8 +250,9 @@ def create_svgd_rollout_fn(
 
                 final_a = action_scale * jnp.tanh(u_final) + action_bias
 
-                log_prob = compute_logqL_closed_form(
+                log_prob = compute_logqL_closed_form_with_tanh(
                     u0,
+                    u_final,
                     u_traj,
                     gradQ_traj,
                     mean,
@@ -419,9 +421,10 @@ def _jit_svgd_rollout_batch(
         # Final action
         final_a = action_scale * jnp.tanh(u_final) + action_bias
 
-        # Compute log probability in u-space (without tanh correction)
-        log_prob = compute_logqL_closed_form(
+        # Compute log probability in ACTION space (with tanh correction)
+        log_prob = compute_logqL_closed_form_with_tanh(
             u0,
+            u_final,
             u_traj,
             gradQ_traj,
             mean,
@@ -1587,6 +1590,7 @@ class S2AC(Agent):
             actor_grad_norm = self._pytree_l2_norm(actor_grad)
 
             # Alpha Update (only when actor updates)
+            alpha_loss = 0.0
             if self._auto_entropy_tuning:
                 log_prob_mean = jax.lax.stop_gradient(actor_metrics["log_prob_mean"])
                 log_prob_mean = jnp.where(
@@ -1840,10 +1844,10 @@ class S2AC(Agent):
         # final scaled action
         final_a = self._action_scale * jnp.tanh(u_final) + self._action_bias
 
-        # compute closed-form log q_L in u-space (without tanh correction)
-        # Alpha tuning expects u-space log_prob to be negative
-        log_prob = compute_logqL_closed_form(
+        # compute closed-form log q_L in ACTION space (with tanh Jacobian correction)
+        log_prob = compute_logqL_closed_form_with_tanh(
             u0,  # initial u
+            u_final,  # final u (before tanh)
             u_traj,  # (T, P, A)
             gradQ_traj,  # (T, P, A)
             mean,

@@ -157,7 +157,12 @@ def _logqL_step(a_curr, gradQ_curr, sigma_kernel, eps, alpha_internal=1.0):
     Compute the incremental log q change for one SVGD step.
     Based on Theorem 3.3 from the S2AC paper.
 
-    Formula: Δlog q_i = -(ε/mσ²) * Σ_{j≠i} K(a_j,a_i) * [(a_i-a_j)^T ∇Q_j + (α/σ²)||a_i-a_j||² - dα]
+    Formula (Theorem 3.3):
+      Δlog q_i = -(ε/(mσ²)) * Σ_{j≠i} K(a_j,a_i) * [(a_i-a_j)^T score_j + (1/σ²)||a_i-a_j||² - d]
+    where score_j = ∇Q_j / α.
+
+    Since we receive raw ∇Q (not scores), we substitute score_j = ∇Q_j / α:
+      Δlog q_i = -(ε/(αmσ²)) * Σ_{j≠i} K_ij * [(a_i-a_j)^T ∇Q_j + (α/σ²)||a_i-a_j||² - dα]
 
     Note: The SVGD updates DECREASE entropy (increase log_prob), so this term is SUBTRACTED
     from log q_0 in the accumulation.
@@ -193,7 +198,7 @@ def _logqL_step(a_curr, gradQ_curr, sigma_kernel, eps, alpha_internal=1.0):
 
     # Sum over j for each i: this gives the change in log q_i
     per_i_sum = jnp.sum(M, axis=1)  # Sum over j (columns)
-    coeff = -eps / ((m + 1e-6) * (sigma_sq + 1e-6))
+    coeff = -eps / ((m + 1e-6) * (sigma_sq + 1e-6) * (alpha_internal + 1e-9))
     return coeff * per_i_sum
 
 
@@ -247,13 +252,14 @@ def compute_logqL_closed_form(
 
     per_step = vmap(step_fn, in_axes=(0, 0, 0))(traj_a, traj_gradQ, sigma_arr)  # (T, m)
 
-    per_step = jnp.clip(per_step, -10.0, 10.0)
+    per_step = jnp.clip(per_step, -20.0, 20.0)
 
     accum = jnp.sum(per_step, axis=0)  # (m,)
 
     logqL = logq0 + accum
-    # Upper bound of 0.0 ensures valid probability; -20.0 lower bound prevents -inf
-    logqL = jnp.clip(logqL, -20.0, 0.0)
+    # Clip for numerical stability; note that log-densities CAN be positive
+    # (continuous densities can exceed 1), so upper bound must be > 0.
+    logqL = jnp.clip(logqL, -50.0, 50.0)
 
     return logqL
 
